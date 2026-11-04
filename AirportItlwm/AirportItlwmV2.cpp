@@ -331,6 +331,13 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
 #ifdef AIRPORT_WCL
+    int awdl_diag = 0;
+    auto ic = fHalService->get80211Controller();
+    ic->ic_awdl_rx_diag_budget = 0;
+    if (PE_parse_boot_argn("itlwm_awdl_diag", &awdl_diag, sizeof(awdl_diag)) && awdl_diag == 1) {
+        ic->ic_awdl_rx_diag_budget = 32;
+        IOLog("itlwm: passive AWDL RX diagnostics enabled (32 frames); AirDrop transport unavailable\n");
+    }
     int he_enabled = 0;
     if (PE_parse_boot_argn("itlwm_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;

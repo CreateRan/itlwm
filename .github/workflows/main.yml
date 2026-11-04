@@ -13,6 +13,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  awdl-protocol-tests:
+    name: AWDL protocol tests
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check frame parsing with address and undefined-behavior sanitizers
+        run: sh tests/run-awdl-tests.sh
+
   build:
     name: ${{ matrix.platform }} (${{ matrix.configuration }})
     runs-on: macos-15-intel
@@ -67,7 +75,7 @@ jobs:
 
   prerelease:
     name: Publish development build
-    needs: build
+    needs: [awdl-protocol-tests, build]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:

@@ -67,6 +67,9 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#ifdef AIRPORT_WCL
+#include <net80211/awdl_frame.h>
+#endif
 
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
@@ -260,6 +263,31 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
    return m;
 }
 
+#ifdef AIRPORT_WCL
+static int
+ieee80211_awdl_read(void *context, size_t offset, void *out, size_t length)
+{
+    return mbuf_copydata((mbuf_t)context, offset, length, out);
+}
+
+/* Observe before net80211 filters frames by infrastructure BSSID/state.
+ * The mbuf remains borrowed and follows the original receive path unchanged.
+ */
+static void
+ieee80211_awdl_observe(struct ieee80211com *ic, mbuf_t m,
+                      const struct ieee80211_rxinfo *rxi)
+{
+    struct itl_awdl_reader reader = {m, mbuf_pkthdr_len(m), ieee80211_awdl_read};
+    struct itl_awdl_action action;
+    if (itl_awdl_parse_action(&reader, &action) != ITL_AWDL_VALID)
+        return;
+    --ic->ic_awdl_rx_diag_budget;
+    printf("itlwm: AWDL RX subtype=%u tlvs=%u types=0x%08x rssi=%d remaining=%u\n",
+           (unsigned)action.subtype, (unsigned)action.tlv_count,
+           action.tlv_types, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
+}
+#endif
+
 /*
  * Process a received frame.  The node associated with the sender
  * should be supplied.  If nothing was found in the node table then
@@ -287,6 +315,10 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
     int hdrlen, hasqos;
     
     _KASSERT(ni != NULL);
+#ifdef AIRPORT_WCL
+    if (ic->ic_awdl_rx_diag_budget)
+        ieee80211_awdl_observe(ic, m, rxi);
+#endif
     
     /* in monitor mode, send everything directly to bpf */
     if (ic->ic_opmode == IEEE80211_M_MONITOR)

@@ -85,3 +85,9 @@ We only accept bug reports in GitHub Issues, before opening an issue, you're rec
 - [@stevezhengshiqi](https://github.com/stevezhengshiqi)
 - [@DogAndPot](https://github.com/DogAndPot) for providing resources and help for system configuration
 - [@Daliansky](https://github.com/Daliansky) for providing Wi-Fi cards
+
+## Experimental AWDL development
+
+This branch adds opt-in passive AWDL discovery-frame diagnostics, not AirDrop
+support. See [development status and validation](docs/awdl/development.md).
+Run protocol tests with `sh tests/run-awdl-tests.sh`.

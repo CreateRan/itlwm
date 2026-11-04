@@ -439,6 +439,8 @@ struct ieee80211com {
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
 #ifdef AIRPORT_WCL
+    /* Passive AWDL discovery diagnostics: bounded log budget, zero by default. */
+    uint32_t ic_awdl_rx_diag_budget;
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;

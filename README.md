@@ -88,6 +88,6 @@ We only accept bug reports in GitHub Issues, before opening an issue, you're rec
 
 ## Experimental AWDL development
 
-This branch adds opt-in passive AWDL diagnostics, offline data/synchronization
+This branch adds opt-in passive AWDL diagnostics, offline data/synchronization/peer-state
 components, and a Tahoe native virtual-interface creation experiment. AirDrop is not implemented. See [development status and validation](docs/awdl/development.md).
 Run protocol tests with `sh tests/run-awdl-tests.sh`.

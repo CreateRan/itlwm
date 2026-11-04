@@ -47,7 +47,7 @@ Protocol facts checked against [OWL frame definitions](https://github.com/seemoo
 and [OWL transmit construction](https://github.com/seemoo-lab/owl/blob/master/src/tx.c).
 No OWL implementation body or captured device packet is included here.
 
-Run `sh tests/run-awdl-tests.sh` for all five ASan/UBSan suites. Encoding golden
+Run `sh tests/run-awdl-tests.sh` for all six ASan/UBSan suites. Encoding golden
 bytes and decoding golden frames are checked independently. Boundary, segment,
 failure and mutation tests cover the error contracts. Passing them establishes
 the tested byte operations, not radio reception/transmission or iPhone support.

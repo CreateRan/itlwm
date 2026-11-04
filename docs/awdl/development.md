@@ -78,6 +78,24 @@ supported observations, using the same 32-frame budget. Unsupported semantic
 profiles keep the generic discovery diagnostic. No observation automatically
 becomes synchronization state or a radio command.
 
+## Implemented offline: bounded peer state and explicit reference
+
+`awdl_peers.h` maintains at most 16 observed MAC records without allocation or
+live RX integration. It refuses fresh additions when full, filters duplicate
+and conservatively old/ambiguous 12-bit management sequences, and expires
+records using caller-provided monotonic time and TTL. Invalid observations do
+not mutate state. Duplicate/old observations cannot refresh liveness or sync
+age; unrelated discovery cannot extend a synchronization snapshot's age.
+Partial timing/sequence updates invalidate an old anchor instead of merging
+observations from different frames.
+
+The caller must explicitly select an existing, live peer with a fresh complete
+snapshot. Removal/expiry clears the choice before slot reuse. Projection copies
+that peer's identity/time and delegates to nominal window arithmetic; it never
+chooses a replacement, trusts a sender or adopts a clock. Clear preserves the
+local identity/time watermark. See [peer-state contract](peer-state.md) for the
+sequence-reset, clock, expiry and security limits.
+
 ## Implemented: opt-in native Tahoe creation and framework-owned teardown
 
 `itlwm_awdl_vif=1` opts into the native creation experiment and enables its
@@ -128,7 +146,12 @@ buffers, exact 4096-byte bounds, reader failures, unsupported profiles and
 Synchronization tests independently encode fixed/embedded/standalone TLVs,
 exercise all three encodings, reader failures, conflicting sequences, split
 buffers and nominal timing boundaries (including 16-bit wrap and UINT64_MAX),
-plus another 20,000 deterministic mutations.
+plus another 20,000 deterministic mutations. Peer-state tests additionally
+cover bounded admission, duplicate/wrap ordering, independent ages, explicit
+selection, removal/expiry, clock limits, partial updates and 10,000 state
+transitions. The peer suite runs as both C11 and C++11 under ASan/UBSan.
+The new table is not integrated into the current driver; no kernel build or
+live deployment is claimed for this table increment.
 
 Build with the pinned MacKernelSDK and the commands in the repository README.
 Artifacts stay in `build/`; installing a kext and changing EFI are separate

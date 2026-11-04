@@ -214,3 +214,12 @@ Wi-Fi path for concurrent AWDL. The legacy queue-v2 codec is integrated into
 both existing IWX queue configuration handlers. It adds strict failure-flag
 rejection and bounds/argument validation, with independent wire fixtures in
 C11/C++11 under ASan/UBSan. It does not activate an AWDL hardware path.
+
+
+## Offline resource ownership
+
+The [IWX station/queue ledger](resource-ownership.md) adds exclusive ID grants,
+epoch/lease/operation tickets, ordered teardown and fail-closed quarantine for
+uncertain outcomes. It is independent of the driver. Integration still requires
+a central allocator, command/version negotiation, real firmware completion and
+DMA/reset fencing. C11/C++11 sanitizer tests exercise its actual transitions.

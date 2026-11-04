@@ -39,3 +39,10 @@ xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
     -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
     -fno-omit-frame-pointer -g -I. tests/iwx_txq_v2_test.c -o "$test_dir/iwx-txq-v2-cxx-tests"
 "$test_dir/iwx-txq-v2-cxx-tests"
+xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_awdl_resources_test.c -o "$test_dir/iwx-awdl-resources-tests"
+"$test_dir/iwx-awdl-resources-tests"
+xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
+    -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_awdl_resources_test.c -o "$test_dir/iwx-awdl-resources-cxx-tests"
+"$test_dir/iwx-awdl-resources-cxx-tests"

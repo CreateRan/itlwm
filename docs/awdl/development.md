@@ -243,3 +243,13 @@ policy to the offline ledger. Station removal and host queue release are separat
 stages, so a station acknowledgement cannot release a queue still owned by DMA.
 The Python metadata audit runs with the test runner; it does not select kernel
 commands or activate the independent ledger.
+
+
+## Explicit station adapter
+
+The [offline station command adapter](station-adapter.md) prepares add/remove
+payloads from the resource lease and correlates completion with its original
+ticket. It checks exact versions and conservatively quarantines ambiguous
+results. Its ABI is checked in the kernel build, but no dispatch is enabled.
+A validated context/type, transport correlation and drain/DMA evidence are still
+required for live integration.

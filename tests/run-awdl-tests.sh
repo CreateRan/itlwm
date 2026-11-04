@@ -54,3 +54,10 @@ xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
     -fno-omit-frame-pointer -g -I. tests/iwx_flush_v1_test.c -o "$test_dir/iwx-flush-v1-cxx-tests"
 "$test_dir/iwx-flush-v1-cxx-tests"
 python3 -B tests/iwx_firmware_audit_test.py
+xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_station_adapter_test.c -o "$test_dir/iwx-station-adapter-tests"
+"$test_dir/iwx-station-adapter-tests"
+xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
+    -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_station_adapter_test.c -o "$test_dir/iwx-station-adapter-cxx-tests"
+"$test_dir/iwx-station-adapter-cxx-tests"

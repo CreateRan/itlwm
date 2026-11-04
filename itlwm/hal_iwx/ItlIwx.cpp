@@ -112,6 +112,7 @@
 #include "ItlIwx.hpp"
 #include "iwx_txq_v2.h"
 #include "iwx_flush_v1.h"
+#include "iwx_station_adapter.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -7497,6 +7498,26 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
     
     return err;
 }
+
+/* Offline station adapter ABI checks only; no command dispatch is enabled. */
+static_assert(sizeof(struct iwx_add_sta_cmd) == ITL_IWX_STATION_ADD_SIZE &&
+    __offsetof(struct iwx_add_sta_cmd, add_modify) == 0 &&
+    __offsetof(struct iwx_add_sta_cmd, tid_disable_tx) == 2 &&
+    __offsetof(struct iwx_add_sta_cmd, mac_id_n_color) == 4 &&
+    __offsetof(struct iwx_add_sta_cmd, addr) == 8 &&
+    __offsetof(struct iwx_add_sta_cmd, sta_id) == 16 &&
+    __offsetof(struct iwx_add_sta_cmd, station_flags) == 20 &&
+    __offsetof(struct iwx_add_sta_cmd, station_flags_msk) == 24 &&
+    __offsetof(struct iwx_add_sta_cmd, station_type) == 35, "station add wire ABI");
+static_assert(sizeof(struct iwx_rm_sta_cmd) == ITL_IWX_STATION_REMOVE_SIZE &&
+    __offsetof(struct iwx_rm_sta_cmd, sta_id) == 0 &&
+    __offsetof(struct iwx_rm_sta_cmd, reserved) == 1, "station remove wire ABI");
+static_assert(sizeof(struct iwx_cmd_response) == 4 &&
+    __offsetof(struct iwx_cmd_response, status) == 0 && IWX_ADD_STA_STATUS_MASK == 0xff &&
+    IWX_ADD_STA_SUCCESS == 1, "station status wire ABI");
+static_assert((IWX_STA_FLG_FAT_EN_MSK | IWX_STA_FLG_MIMO_EN_MSK) == 0x3c000000 &&
+    IWX_FW_CTXT_ID_POS == 0 && IWX_FW_CTXT_COLOR_POS == 8 && IWX_STA_AUX_ACTIVITY == 4,
+    "station narrow wire profile");
 
 int ItlIwx::
 iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)

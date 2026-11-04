@@ -32,9 +32,14 @@ first, then integrate only once a central allocator and firmware adapter exist.
 - Caller records command intent before submission. Outcomes are SUCCESS,
   REJECTED (authoritative no-effect rejection) and UNKNOWN (possibly applied).
   Transport errors/timeouts must be UNKNOWN, not assumed rejection.
-- Order: reserve -> add station -> allocate queue -> ready; teardown: close ->
+- Explicit queue_lifetime policy is required: SEPARATE_REMOVE or STATION_BOUND.
+  Zero/unknown is rejected. Station-bound mode uses drain -> station removal ->
+  STATION_GONE (retain both IDs) -> RELEASE_HOST_QUEUE after a proven DMA fence.
+  That final action is host cleanup, not a firmware command. Uncertain outcomes
+  retain ownership; no new station/queue commands are enabled by this policy.
+- Order: reserve -> add station -> allocate queue -> ready; separate-policy teardown: close ->
   drain -> remove queue -> remove station. Reserved-only leases may be canceled.
-  No station removal before confirmed queue removal. Failed teardown is retryable.
+  In the separate policy, no station removal before confirmed queue removal. Failed teardown is retryable.
 - Close is monotonic and blocks TX even if an in-flight creation later succeeds.
   Every TX lookup validates the handle and requires ready, not closing, no fault.
 - Unknown outcomes quarantine resources until confirmed hardware reset. Unknown

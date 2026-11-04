@@ -35,6 +35,13 @@ Output/handle/ticket storage is separate from inputs and the ledger. Handles
 belong to one ledger instance. Do not mix handles from independent ledgers,
 reinitialize a live ledger, or reconstruct it with a previously used epoch.
 
+## Queue lifetime policy
+
+`queue_lifetime` must be explicitly SEPARATE_REMOVE or STATION_BOUND; zero/unknown
+is invalid. The table below describes SEPARATE_REMOVE. Station-bound firmware
+instead uses drain -> station removal -> host queue release, retaining both IDs
+until the host lifetime fence. See [legacy firmware evidence and staged release](queue-lifetime.md).
+
 ## Lifecycle and tickets
 
 `reserve` returns the lowest granted unused station. Duplicate MACs, exhausted
@@ -51,7 +58,7 @@ nothing, including when a slot has been reused or a later command is pending.
 | Queue idle | REMOVE_QUEUE | Station exists, queue no longer owned |
 | Station exists | REMOVE_STATION | Lease released |
 
-Reserved-only leases can be canceled. All other releases require the ordered
+Reserved-only leases can be canceled. All other releases require the selected policy's ordered
 completion path or a confirmed reset. `close` is monotonic and can be recorded
 during an in-flight command; a late successful creation still cannot reopen
 TX. Drain and removal intents close the lease automatically. New creation is

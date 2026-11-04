@@ -14,17 +14,22 @@ enum itl_iwx_awdl_resource_result {
 enum itl_iwx_awdl_resource_phase {
     ITL_IWX_RESOURCE_FREE, ITL_IWX_RESOURCE_RESERVED, ITL_IWX_RESOURCE_STATION,
     ITL_IWX_RESOURCE_READY, ITL_IWX_RESOURCE_QUEUE_IDLE,
-    ITL_IWX_RESOURCE_PENDING, ITL_IWX_RESOURCE_QUARANTINED
+    ITL_IWX_RESOURCE_PENDING, ITL_IWX_RESOURCE_QUARANTINED, ITL_IWX_RESOURCE_STATION_GONE
 };
 enum itl_iwx_awdl_resource_action {
     ITL_IWX_RESOURCE_ADD_STATION = 1, ITL_IWX_RESOURCE_ALLOC_QUEUE,
     ITL_IWX_RESOURCE_DRAIN_QUEUE, ITL_IWX_RESOURCE_REMOVE_QUEUE,
-    ITL_IWX_RESOURCE_REMOVE_STATION
+    ITL_IWX_RESOURCE_REMOVE_STATION, ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE
 };
 enum itl_iwx_awdl_resource_outcome {
     ITL_IWX_RESOURCE_SUCCESS, ITL_IWX_RESOURCE_DENIED, ITL_IWX_RESOURCE_UNCERTAIN
 };
+enum itl_iwx_awdl_queue_lifetime {
+    ITL_IWX_RESOURCE_LIFETIME_UNKNOWN,
+    ITL_IWX_RESOURCE_SEPARATE_REMOVE, ITL_IWX_RESOURCE_STATION_BOUND
+};
 struct itl_iwx_awdl_resource_config {
+    uint8_t queue_lifetime;
     uint16_t station_count, queue_count, station_mask;
     uint8_t queue_mask[ITL_IWX_AWDL_QUEUES / 8];
 };
@@ -60,7 +65,9 @@ itl_iwx_awdl_resources_init(struct itl_iwx_awdl_resources *p,
 {
     if (!p || !c || !epoch || c->station_count < 3 || c->station_count > 16 ||
         c->queue_count < 10 || c->queue_count > 512 ||
-        (c->station_mask & 7) || (c->station_mask >> c->station_count))
+        (c->station_mask & 7) || (c->station_mask >> c->station_count) ||
+        (c->queue_lifetime != ITL_IWX_RESOURCE_SEPARATE_REMOVE &&
+         c->queue_lifetime != ITL_IWX_RESOURCE_STATION_BOUND))
         return ITL_IWX_RESOURCE_INVALID;
     for (unsigned q = 0; q < ITL_IWX_AWDL_QUEUES; ++q)
         if ((c->queue_mask[q / 8] & (1U << (q % 8))) &&
@@ -180,7 +187,7 @@ itl_iwx_awdl_resources_begin(struct itl_iwx_awdl_resources *p,
         return ITL_IWX_RESOURCE_INVALID;
     memset(out, 0, sizeof(*out));
     if (!p || p->configured != 1 || !h ||
-        a < ITL_IWX_RESOURCE_ADD_STATION || a > ITL_IWX_RESOURCE_REMOVE_STATION)
+        a < ITL_IWX_RESOURCE_ADD_STATION || a > ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE)
         return ITL_IWX_RESOURCE_INVALID;
     int i = itl_iwx_awdl_resources_find(p, h);
     if (i < 0)
@@ -191,11 +198,20 @@ itl_iwx_awdl_resources_begin(struct itl_iwx_awdl_resources *p,
         return ITL_IWX_RESOURCE_FAULT;
     if (creation && e->closing)
         return ITL_IWX_RESOURCE_STATE;
+    if ((a == ITL_IWX_RESOURCE_REMOVE_QUEUE &&
+         p->config.queue_lifetime != ITL_IWX_RESOURCE_SEPARATE_REMOVE) ||
+        (a == ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE &&
+         p->config.queue_lifetime != ITL_IWX_RESOURCE_STATION_BOUND))
+        return ITL_IWX_RESOURCE_STATE;
     uint8_t expected = ITL_IWX_RESOURCE_RESERVED;
     switch (a) {
     case ITL_IWX_RESOURCE_ADD_STATION: expected = ITL_IWX_RESOURCE_RESERVED; break;
-    case ITL_IWX_RESOURCE_ALLOC_QUEUE:
-    case ITL_IWX_RESOURCE_REMOVE_STATION: expected = ITL_IWX_RESOURCE_STATION; break;
+    case ITL_IWX_RESOURCE_ALLOC_QUEUE: expected = ITL_IWX_RESOURCE_STATION; break;
+    case ITL_IWX_RESOURCE_REMOVE_STATION:
+        expected = p->config.queue_lifetime == ITL_IWX_RESOURCE_STATION_BOUND && e->has_queue ?
+            ITL_IWX_RESOURCE_QUEUE_IDLE : ITL_IWX_RESOURCE_STATION;
+        break;
+    case ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE: expected = ITL_IWX_RESOURCE_STATION_GONE; break;
     case ITL_IWX_RESOURCE_DRAIN_QUEUE: expected = ITL_IWX_RESOURCE_READY; break;
     case ITL_IWX_RESOURCE_REMOVE_QUEUE: expected = ITL_IWX_RESOURCE_QUEUE_IDLE; break;
     }
@@ -231,7 +247,10 @@ itl_iwx_awdl_resources_begin(struct itl_iwx_awdl_resources *p,
 /* DENIED is valid only for a definitive no-effect result. A timeout, malformed
  * reply or transport error after possible submission is UNCERTAIN. SUCCESS for
  * DRAIN/REMOVE_QUEUE requires actual firmware completion and DMA quiescence,
- * not merely sending a command or clearing a host-side ring.
+ * not merely sending a command or clearing a host-side ring. In station-bound
+ * mode, REMOVE_STATION confirms station absence only and retains queue/lease.
+ * RELEASE_HOST_QUEUE is a host lifetime fence, not a firmware command: success
+ * additionally certifies no possible device DMA and completed host cleanup.
  */
 static inline enum itl_iwx_awdl_resource_result
 itl_iwx_awdl_resources_complete(struct itl_iwx_awdl_resources *p,
@@ -261,8 +280,12 @@ itl_iwx_awdl_resources_complete(struct itl_iwx_awdl_resources *p,
     if (result == ITL_IWX_RESOURCE_DENIED) {
         switch (action) {
         case ITL_IWX_RESOURCE_ADD_STATION: memset(e, 0, sizeof(*e)); break;
-        case ITL_IWX_RESOURCE_ALLOC_QUEUE:
-        case ITL_IWX_RESOURCE_REMOVE_STATION: e->phase = ITL_IWX_RESOURCE_STATION; break;
+        case ITL_IWX_RESOURCE_ALLOC_QUEUE: e->phase = ITL_IWX_RESOURCE_STATION; break;
+        case ITL_IWX_RESOURCE_REMOVE_STATION:
+            e->phase = p->config.queue_lifetime == ITL_IWX_RESOURCE_STATION_BOUND && e->has_queue ?
+                ITL_IWX_RESOURCE_QUEUE_IDLE : ITL_IWX_RESOURCE_STATION;
+            break;
+        case ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE: e->phase = ITL_IWX_RESOURCE_STATION_GONE; break;
         case ITL_IWX_RESOURCE_DRAIN_QUEUE: e->phase = ITL_IWX_RESOURCE_READY; break;
         case ITL_IWX_RESOURCE_REMOVE_QUEUE: e->phase = ITL_IWX_RESOURCE_QUEUE_IDLE; break;
         }
@@ -299,6 +322,12 @@ itl_iwx_awdl_resources_complete(struct itl_iwx_awdl_resources *p,
         e->phase = ITL_IWX_RESOURCE_STATION;
         break;
     case ITL_IWX_RESOURCE_REMOVE_STATION:
+        if (e->has_queue && p->config.queue_lifetime == ITL_IWX_RESOURCE_STATION_BOUND)
+            e->phase = ITL_IWX_RESOURCE_STATION_GONE;
+        else
+            memset(e, 0, sizeof(*e));
+        break;
+    case ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE:
         memset(e, 0, sizeof(*e));
         break;
     }

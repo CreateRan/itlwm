@@ -10,6 +10,7 @@ static const uint8_t bob[6] = {2,0,0,0,0,2};
 static struct itl_iwx_awdl_resource_config config(void)
 {
     struct itl_iwx_awdl_resource_config c = {0};
+    c.queue_lifetime=ITL_IWX_RESOURCE_SEPARATE_REMOVE;
     c.station_count = 16; c.queue_count = 512; c.station_mask = 0xfff8;
     c.queue_mask[1] = 0x0c; /* Exclusive grants 10, 11, 511. */
     c.queue_mask[63] = 0x80;
@@ -271,6 +272,79 @@ static void test_inflight_queue_capacity_is_reserved(void)
     success(&p,b,ITL_IWX_RESOURCE_REMOVE_QUEUE,0);
     success(&p,a,ITL_IWX_RESOURCE_ALLOC_QUEUE,10);
 }
+static void test_legacy_station_then_host_queue_release(void)
+{
+    for (unsigned outcome=0;outcome<3;++outcome) {
+        struct itl_iwx_awdl_resource_config c=config();
+        c.queue_lifetime=ITL_IWX_RESOURCE_STATION_BOUND;
+        struct itl_iwx_awdl_resources p;
+        assert(itl_iwx_awdl_resources_init(&p,&c,1)==ITL_IWX_RESOURCE_OK);
+        struct itl_iwx_awdl_resource_handle h=ready(&p,alice,10);
+        struct itl_iwx_awdl_resource_ticket t;
+        assert(itl_iwx_awdl_resources_begin(&p,&h,ITL_IWX_RESOURCE_REMOVE_STATION,&t)==ITL_IWX_RESOURCE_STATE);
+        success(&p,h,ITL_IWX_RESOURCE_DRAIN_QUEUE,0);
+        struct itl_iwx_awdl_resources before=p;
+        assert(itl_iwx_awdl_resources_begin(&p,&h,ITL_IWX_RESOURCE_REMOVE_QUEUE,&t)==ITL_IWX_RESOURCE_STATE);
+        assert(memcmp(&before,&p,sizeof(p))==0);
+        t=begin(&p,h,ITL_IWX_RESOURCE_REMOVE_STATION);
+        assert(itl_iwx_awdl_resources_complete(&p,&t,ITL_IWX_RESOURCE_DENIED,0)==ITL_IWX_RESOURCE_REJECTED);
+        assert(p.entries[h.station].phase==ITL_IWX_RESOURCE_QUEUE_IDLE && p.entries[h.station].has_queue);
+        success(&p,h,ITL_IWX_RESOURCE_REMOVE_STATION,0);
+        assert(p.entries[h.station].phase==ITL_IWX_RESOURCE_STATION_GONE);
+        assert(p.entries[h.station].has_queue && p.entries[h.station].queue==10);
+        no_tx(&p,h);
+        struct itl_iwx_awdl_resource_handle out;
+        assert(itl_iwx_awdl_resources_reserve(&p,alice,&out)==ITL_IWX_RESOURCE_DUPLICATE);
+        struct itl_iwx_awdl_resource_ticket release=begin(&p,h,ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE);
+        assert(itl_iwx_awdl_resources_complete(&p,&t,ITL_IWX_RESOURCE_SUCCESS,0)==ITL_IWX_RESOURCE_STALE);
+        enum itl_iwx_awdl_resource_result expected=outcome==0?ITL_IWX_RESOURCE_OK:
+            outcome==1?ITL_IWX_RESOURCE_REJECTED:ITL_IWX_RESOURCE_UNKNOWN;
+        assert(itl_iwx_awdl_resources_complete(&p,&release,(enum itl_iwx_awdl_resource_outcome)outcome,0)==expected);
+        if (outcome==1) {
+            assert(p.entries[h.station].phase==ITL_IWX_RESOURCE_STATION_GONE && p.entries[h.station].has_queue);
+            success(&p,h,ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE,0);
+        }
+        if (outcome==2) {
+            assert(p.entries[h.station].phase==ITL_IWX_RESOURCE_QUARANTINED && p.entries[h.station].has_queue);
+            assert(itl_iwx_awdl_resources_cancel(&p,&h)==ITL_IWX_RESOURCE_STATE);
+            assert(itl_iwx_awdl_resources_reset(&p,2)==ITL_IWX_RESOURCE_OK);
+        }
+        out=reserve(&p,alice); assert(out.station==3); no_tx(&p,out);
+        assert(itl_iwx_awdl_resources_complete(&p,&release,ITL_IWX_RESOURCE_SUCCESS,0)==ITL_IWX_RESOURCE_STALE);
+    }
+    struct itl_iwx_awdl_resources p; init(&p);
+    struct itl_iwx_awdl_resource_handle h=ready(&p,alice,10);
+    struct itl_iwx_awdl_resource_ticket t;
+    success(&p,h,ITL_IWX_RESOURCE_DRAIN_QUEUE,0);
+    assert(itl_iwx_awdl_resources_begin(&p,&h,ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE,&t)==ITL_IWX_RESOURCE_STATE);
+    struct itl_iwx_awdl_resource_config c=config(); c.queue_lifetime=ITL_IWX_RESOURCE_STATION_BOUND;
+    assert(itl_iwx_awdl_resources_init(&p,&c,2)==ITL_IWX_RESOURCE_OK);
+    h=reserve(&p,alice);
+    success(&p,h,ITL_IWX_RESOURCE_ADD_STATION,0);
+    assert(itl_iwx_awdl_resources_begin(&p,&h,ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE,&t)==ITL_IWX_RESOURCE_STATE);
+    success(&p,h,ITL_IWX_RESOURCE_REMOVE_STATION,0);
+    struct itl_iwx_awdl_resource_handle out=reserve(&p,alice);
+    assert(out.station==3 && out.lease!=h.lease);
+}
+static void test_legacy_unknown_station_removal_keeps_queue(void)
+{
+    struct itl_iwx_awdl_resource_config c=config();
+    c.queue_lifetime=ITL_IWX_RESOURCE_STATION_BOUND;
+    struct itl_iwx_awdl_resources p;
+    assert(itl_iwx_awdl_resources_init(&p,&c,1)==ITL_IWX_RESOURCE_OK);
+    struct itl_iwx_awdl_resource_handle h=ready(&p,alice,10);
+    success(&p,h,ITL_IWX_RESOURCE_DRAIN_QUEUE,0);
+    struct itl_iwx_awdl_resource_ticket t=begin(&p,h,ITL_IWX_RESOURCE_REMOVE_STATION);
+    assert(itl_iwx_awdl_resources_complete(&p,&t,ITL_IWX_RESOURCE_UNCERTAIN,0)==ITL_IWX_RESOURCE_UNKNOWN);
+    assert(p.entries[h.station].phase==ITL_IWX_RESOURCE_QUARANTINED && p.entries[h.station].has_queue);
+    struct itl_iwx_awdl_resource_ticket release;
+    assert(itl_iwx_awdl_resources_begin(&p,&h,ITL_IWX_RESOURCE_RELEASE_HOST_QUEUE,&release)==ITL_IWX_RESOURCE_STATE);
+    struct itl_iwx_awdl_resource_handle other=reserve(&p,bob);
+    success(&p,other,ITL_IWX_RESOURCE_ADD_STATION,0);
+    t=begin(&p,other,ITL_IWX_RESOURCE_ALLOC_QUEUE);
+    assert(itl_iwx_awdl_resources_complete(&p,&t,ITL_IWX_RESOURCE_SUCCESS,10)==ITL_IWX_RESOURCE_CONFLICT);
+    assert(p.entries[h.station].has_queue && p.entries[h.station].queue==10);
+}
 static void test_validation_reset_and_counter_limits(void)
 {
     struct itl_iwx_awdl_resources p; init(&p);
@@ -283,6 +357,10 @@ static void test_validation_reset_and_counter_limits(void)
     c=config(); c.station_count=15; assert(itl_iwx_awdl_resources_init(&p,&c,100)==ITL_IWX_RESOURCE_INVALID);
     c=config(); c.queue_count=511; assert(itl_iwx_awdl_resources_init(&p,&c,100)==ITL_IWX_RESOURCE_INVALID);
     c=config(); c.queue_mask[0]=1; assert(itl_iwx_awdl_resources_init(&p,&c,100)==ITL_IWX_RESOURCE_INVALID);
+    c=config(); c.queue_lifetime=ITL_IWX_RESOURCE_LIFETIME_UNKNOWN;
+    assert(itl_iwx_awdl_resources_init(&p,&c,100)==ITL_IWX_RESOURCE_INVALID);
+    c=config(); c.queue_lifetime=255;
+    assert(itl_iwx_awdl_resources_init(&p,&c,100)==ITL_IWX_RESOURCE_INVALID);
     assert(memcmp(&before,&p,sizeof(p))==0);
     struct itl_iwx_awdl_resource_handle h,out;
     uint8_t invalid[6]={0};
@@ -318,6 +396,8 @@ int main(void)
     test_two_peers_and_reuse_only_after_confirmed_removal();
     test_empty_grants_and_last_serial_completion();
     test_inflight_queue_capacity_is_reserved();
+    test_legacy_station_then_host_queue_release();
+    test_legacy_unknown_station_removal_keeps_queue();
     test_validation_reset_and_counter_limits();
     puts("IWX AWDL resource ownership tests passed");
 }

@@ -233,3 +233,13 @@ before updating rings and distinguishes no-payload compatibility from positive
 queue evidence. See [flush validation and removal investigation](flush-evidence.md)
 for the TID bounds finding, integration details and unresolved firmware removal
 profile. This does not activate AWDL commands or the resource ledger.
+
+
+## Legacy queue lifetime
+
+The [firmware metadata audit and queue lifetime extension](queue-lifetime.md)
+identify the bundled firmware's older command profile and add a required explicit
+policy to the offline ledger. Station removal and host queue release are separate
+stages, so a station acknowledgement cannot release a queue still owned by DMA.
+The Python metadata audit runs with the test runner; it does not select kernel
+commands or activate the independent ledger.

@@ -14,3 +14,6 @@ xcrun clang++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined \
 xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
     -fno-omit-frame-pointer -g -I. tests/awdl_data_test.c -o "$test_dir/awdl-data-tests"
 "$test_dir/awdl-data-tests"
+xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/awdl_sync_test.c -o "$test_dir/awdl-sync-tests"
+"$test_dir/awdl-sync-tests"

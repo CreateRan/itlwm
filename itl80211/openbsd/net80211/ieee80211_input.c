@@ -69,6 +69,7 @@
 #include <net80211/ieee80211_priv.h>
 #ifdef AIRPORT_WCL
 #include <net80211/awdl_data.h>
+#include <net80211/awdl_sync.h>
 #endif
 
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
@@ -281,9 +282,17 @@ ieee80211_awdl_observe(struct ieee80211com *ic, mbuf_t m,
     struct itl_awdl_action action;
     if (itl_awdl_parse_action(&reader, &action) == ITL_AWDL_VALID) {
         --ic->ic_awdl_rx_diag_budget;
-        printf("itlwm: AWDL RX subtype=%u tlvs=%u types=0x%08x rssi=%d remaining=%u\n",
-               (unsigned)action.subtype, (unsigned)action.tlv_count,
-               action.tlv_types, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
+        struct itl_awdl_sync sync;
+        if (itl_awdl_parse_sync(&reader, &sync) == ITL_AWDL_VALID && sync.has_sync) {
+            printf("itlwm: AWDL SYNC RX awTU=%u downTU=%u counter=%u sequence=%u encoding=%u remaining=%u\n",
+                   (unsigned)sync.aw_period_tu, (unsigned)sync.tx_down_counter_tu,
+                   (unsigned)sync.aw_counter, (unsigned)sync.has_sequence,
+                   (unsigned)sync.sequence.encoding, ic->ic_awdl_rx_diag_budget);
+        } else {
+            printf("itlwm: AWDL RX subtype=%u tlvs=%u types=0x%08x rssi=%d remaining=%u\n",
+                   (unsigned)action.subtype, (unsigned)action.tlv_count,
+                   action.tlv_types, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
+        }
         return;
     }
     struct itl_awdl_data data;

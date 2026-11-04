@@ -17,8 +17,8 @@ The allocation-free parser reads across mbuf boundaries, checks the Apple OUI,
 AWDL type/version/subtype and TLV lengths, and reports timestamps, addresses and
 TLV presence. Unknown TLVs are skipped. Encrypted and fragmented frames are not
 parsed. The reader expects FCS-free 802.11 frames, without a radiotap prefix.
-The 4096-byte maximum bounds work on untrusted frames. Only structural TLV
-validation is implemented; synchronization/election TLV contents are not used.
+The 4096-byte maximum bounds work on untrusted frames. The generic parser validates TLV extents; the separate synchronization parser
+extracts the limited semantics described below. No election state is adopted.
 
 A log such as `itlwm: AWDL RX subtype=3 ...` establishes that an AWDL action
 frame reached the software receive path. It does not establish peer discovery
@@ -53,6 +53,30 @@ consume, alter, redirect or deliver the original mbuf.
 The user requested offline development; no installed kext, EFI file, or boot
 argument was changed. Unit fixtures use invented addresses and byte literals,
 not captures containing real device data.
+
+## Implemented offline: synchronization metadata and nominal windows
+
+`awdl_sync.h` parses synchronization TLV 4 and embedded/standalone channel
+sequences (TLV 18) from a structurally valid discovery frame. The supported
+profile uses 16 entries, presence mode 4, step count 3, zero duplication and
+`FFFF` fill. Simple, legacy and operating-class encodings preserve channel
+and auxiliary bytes without interpreting radio eligibility. Duplicate relevant
+TLVs, contradictory embedded/standalone sequences, bad lengths and padding
+are rejected without exposing a partial result.
+
+The pure projection helper consumes a caller-provided observation time and
+freshness limit. It returns a nominal AW counter, sequence index/channel,
+and relative times to the next AW/EAW boundary, with 16-bit wrap and integer
+TU conversion. It never installs a timer, updates a clock, elects a master,
+changes channel or submits a frame. A zero channel means an idle slot.
+The helper follows the documented four-AW profile; peer trust, RX timestamp
+bias, clock drift, guard times and regulatory/firmware constraints remain work
+for a real scheduler. See [synchronization contract](synchronization.md).
+
+The existing passive observer optionally prints `AWDL SYNC RX` metadata for
+supported observations, using the same 32-frame budget. Unsupported semantic
+profiles keep the generic discovery diagnostic. No observation automatically
+becomes synchronization state or a radio command.
 
 ## Implemented: opt-in native Tahoe creation and framework-owned teardown
 
@@ -101,6 +125,10 @@ use independent golden bytes for encode and decode (not just a round-trip),
 including short output buffers, 802.11/QoS/HT truncation, unaligned chained
 buffers, exact 4096-byte bounds, reader failures, unsupported profiles and
 20,000 additional deterministic mutated inputs under ASan/UBSan.
+Synchronization tests independently encode fixed/embedded/standalone TLVs,
+exercise all three encodings, reader failures, conflicting sequences, split
+buffers and nominal timing boundaries (including 16-bit wrap and UINT64_MAX),
+plus another 20,000 deterministic mutations.
 
 Build with the pinned MacKernelSDK and the commands in the repository README.
 Artifacts stay in `build/`; installing a kext and changing EFI are separate
@@ -123,7 +151,7 @@ Hardware-dependent path:
 2. Establish Intel firmware MAC/PHY context, station/queue binding and action
    frame transmission on a single channel. Confirm transmission with a second
    receiver; a software TX counter alone is insufficient.
-3. Parse synchronization/election/channel-sequence contents and implement
+3. Complete election and extended synchronization semantics, implement
    channel/time-event scheduling, then route AWDL data TX/RX to the macOS peer
    interface with bounded peer state, cancellation and suspend/resume cleanup.
 4. Validate IPv6 neighbor discovery and service discovery, then the Finder to

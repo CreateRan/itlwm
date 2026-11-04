@@ -253,3 +253,12 @@ ticket. It checks exact versions and conservatively quarantines ambiguous
 results. Its ABI is checked in the kernel build, but no dispatch is enabled.
 A validated context/type, transport correlation and drain/DMA evidence are still
 required for live integration.
+
+
+## Staged drain evidence
+
+The [offline drain adapter](drain-adapter.md) sequences drain-flow confirmation,
+matching explicit queue flush evidence and a separately validated host fence.
+Every stage retains the original resource ticket; firmware acknowledgements alone
+do not finish the ledger drain. It is compiled and host-tested without enabling
+hardware dispatch or claiming real TX/DMA quiescence.

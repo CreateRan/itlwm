@@ -113,6 +113,7 @@
 #include "iwx_txq_v2.h"
 #include "iwx_flush_v1.h"
 #include "iwx_station_adapter.h"
+#include "iwx_drain_adapter.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -7498,6 +7499,15 @@ iwx_disable_beacon_filter(struct iwx_softc *sc)
     
     return err;
 }
+
+/* Staged drain adapter is compiled/checked, but never dispatched here. */
+static_assert(IWX_STA_MODE_MODIFY == 1 && IWX_STA_FLG_DRAIN_FLOW == 0x1000 &&
+    IWX_TXPATH_FLUSH == 0x1e && IWX_ADD_STA == 0x18 && IWX_LONG_GROUP == 1,
+    "drain command profile");
+static_assert(sizeof(struct iwx_tx_path_flush_cmd) == 8 &&
+    __offsetof(struct iwx_tx_path_flush_cmd, sta_id) == 0 &&
+    __offsetof(struct iwx_tx_path_flush_cmd, tid_mask) == 4 &&
+    __offsetof(struct iwx_tx_path_flush_cmd, reserved) == 6, "flush request ABI");
 
 /* Offline station adapter ABI checks only; no command dispatch is enabled. */
 static_assert(sizeof(struct iwx_add_sta_cmd) == ITL_IWX_STATION_ADD_SIZE &&

@@ -15,6 +15,15 @@
 #include "AirportItlwmSkywalkInterface.hpp"
 #include "IOPCIEDeviceWrapper.hpp"
 
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+#include "AWDL/InterfacePolicy.hpp"
+// Verified on Tahoe 25G332. The system metaclass supplies the actual object
+// size; use the exported initializer without the incompatible legacy header.
+extern "C" bool airportAWDLVirtualInit(IO80211SkywalkInterface *, IO80211Controller *,
+    ether_addr *, unsigned int, const char *)
+    __asm__("__ZN23IO80211VirtualInterface4initEP17IO80211ControllerP10ether_addrjPKc");
+#endif
+
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
 OSDefineMetaClassAndStructors(CTimeout, OSObject)
@@ -24,6 +33,9 @@ IOCommandGate *_fCommandGate;
 
 void AirportItlwm::releaseAll()
 {
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+    disableAWDLFactory();
+#endif
 #ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportItlwmSkywalkInterface *>(fNetIf)->stopWCL();
@@ -331,6 +343,11 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
 #ifdef AIRPORT_WCL
+#if __IO80211_TARGET == __MAC_26_0
+    int awdl_factory = 0;
+    experimentalAWDLFactoryEnabled = PE_parse_boot_argn("itlwm_awdl_factory", &awdl_factory,
+        sizeof(awdl_factory)) && awdl_factory == 1;
+#endif
     int awdl_diag = 0;
     auto ic = fHalService->get80211Controller();
     ic->ic_awdl_rx_diag_budget = 0;
@@ -477,6 +494,9 @@ bool AirportItlwm::start(IOService *provider)
 
 void AirportItlwm::stop(IOService *provider)
 {
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+    disableAWDLFactory();
+#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
 #ifdef AIRPORT_WCL
@@ -1391,3 +1411,42 @@ void AirportItlwm::setPowerStateOn()
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
+
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+IO80211VirtualInterface *AirportItlwm::createVirtualInterface(ether_addr *address, unsigned int role)
+{
+    if (role != APPLE80211_VIF_AWDL)
+        return super::createVirtualInterface(address, role);
+    static_assert(APPLE80211_VIF_AWDL == 6, "Tahoe AWDL role");
+    if (!_fWorkloop || !_fWorkloop->inGate() ||
+        AirportAWDL::planFactory(experimentalAWDLFactoryEnabled, role,
+            address ? address->octet : nullptr) != AirportAWDL::FactoryPlan::Create)
+        return nullptr;
+    OSObject *object = OSMetaClass::allocClassWithName("IO80211VirtualInterface");
+    if (!object) return nullptr;
+    auto interface = OSDynamicCast(IO80211SkywalkInterface, object);
+    if (!interface || !airportAWDLVirtualInit(interface, this, address, role, "awdl")) {
+        object->release();
+        return nullptr;
+    }
+    // Match the base controller factory contract: initialized, unattached,
+    // +1 ownership. The future attachment caller must own the whole lifecycle.
+    return reinterpret_cast<IO80211VirtualInterface *>(interface);
+}
+
+IOReturn AirportItlwm::disableAWDLFactoryGated(OSObject *owner, void *, void *, void *, void *)
+{
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    if (!self) return kIOReturnBadArgument;
+    self->experimentalAWDLFactoryEnabled = false;
+    return kIOReturnSuccess;
+}
+
+void AirportItlwm::disableAWDLFactory()
+{
+    if (_fCommandGate)
+        _fCommandGate->runAction(disableAWDLFactoryGated);
+    else
+        experimentalAWDLFactoryEnabled = false;
+}
+#endif

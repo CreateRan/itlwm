@@ -144,6 +144,14 @@ public:
         return kIOReturnSuccess;
     }
     
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+    // Factory-only prototype. No native setter attaches or owns this object yet.
+    virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *, unsigned int) override;
+    static IOReturn disableAWDLFactoryGated(OSObject *, void *, void *, void *, void *);
+    void disableAWDLFactory();
+    bool experimentalAWDLFactoryEnabled = false;
+#endif
+
     virtual bool getLogPipes(CCPipe**, CCPipe**, CCPipe**) override;
     
 #ifdef AIRPORT_WCL

@@ -27,13 +27,39 @@ No logs also cannot establish that the iPhone sent nothing: firmware filters
 and current channel selection can prevent these frames from reaching software.
 The diagnostic does not enable monitor mode or change the infrastructure link.
 
+## Implemented: Tahoe factory-only prototype
+
+`itlwm_awdl_factory=1` opts into a **Tahoe-only factory prototype**. It only
+accepts AWDL role 6 and nonzero unicast addresses, and only runs within the
+controller workloop gate. Other roles delegate to the system factory. The
+factory uses the system metaclass allocator and exported initializer without
+including the legacy class declaration. It returns an initialized, unattached
+system object with one reference, matching the system factory contract.
+On failure it releases the allocation. Controller shutdown disables new
+factory calls under the gate before tearing down dependencies.
+
+**The native create setter remains unsupported.** This code does not call
+attach/register, keep an interface pointer, or introduce driver-owned child
+cleanup. The boot argument alone therefore cannot create `awdl0`. This is a
+foundation for a future attachment owner, not a usable interface feature.
+Sequoia retains its previous factory behavior. Neither a live factory call nor
+private-symbol resolution at kext load time has been verified on hardware.
+
+Review rejected the initial driver-owned attachment approach: a child refusing
+termination could outlive HAL/gate/workloop teardown. An ownership design that
+keeps all callback dependencies alive through child termination must precede
+native creation. Simply retaining a child reference or retrying termination is
+insufficient. See [local ABI evidence](tahoe-abi.md).
+
 ## Validation
 
 Run `sh tests/run-awdl-tests.sh`. Tests use hand-encoded protocol fixtures,
 including truncated TLVs, unknown types, fragmented/protected frames, HT Control,
 every possible two-segment split, unaligned buffers, reader failure, oversized
 lengths, and 20,000 deterministic mutated inputs under ASan/UBSan.
-The parser is shared by these tests and the actual receive path.
+The parser is shared by these tests and the actual receive path. Factory
+policy tests cover opt-in, roles, and invalid MACs; they do not emulate or
+validate IOKit object allocation or lifecycle calls.
 
 Build with the pinned MacKernelSDK and the commands in the repository README.
 Artifacts stay in `build/`; installing a kext and changing EFI are separate
@@ -42,8 +68,10 @@ branch. Do not interpret a successful build as verified AWDL interoperability.
 
 ## Next dependencies, in order
 
-1. Verify the Tahoe virtual-interface ABI and creation/lifetime callbacks.
-   Existing legacy `IO80211VirtualInterface.h` must not be assumed ABI-compatible.
+1. Design ownership for native interface attachment, including termination
+   refusal, registration timing, repeated requests, and controller teardown.
+   Then validate lifecycle on hardware. ABI symbols/slots were inspected on
+   25G332; other builds need their own check.
 2. Establish Intel firmware MAC/PHY context, station/queue binding and action
    frame transmission on a single channel. Confirm transmission with a second
    receiver; a software TX counter alone is insufficient.

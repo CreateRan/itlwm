@@ -8,8 +8,8 @@ an iPhone using Finder AirDrop. **This branch does not yet implement AirDrop.**
 ## Implemented: passive discovery-frame receive diagnostics
 
 `itlwm_awdl_diag=1` enables an observer before the net80211 infrastructure
-BSSID/state filters. It logs at most 32 structurally valid AWDL PSF/MIF frames
-per driver start. With no boot argument the observer is disabled. This path
+BSSID/state filters. It logs at most 32 structurally valid AWDL discovery/data frames
+per driver start, sharing one budget across both kinds. With no boot argument the observer is disabled. This path
 neither changes radio filters/channels nor consumes, modifies, or retains the
 received mbuf. It does not create `awdl0` or advertise AWDL capabilities.
 
@@ -26,6 +26,33 @@ in Finder, protocol synchronization, or successful delivery to an iPhone.
 No logs also cannot establish that the iPhone sent nothing: firmware filters
 and current channel selection can prevent these frames from reaching software.
 The diagnostic does not enable monitor mode or change the infrastructure link.
+
+## Implemented offline: data wire codec
+
+`awdl_data.h` adds a no-allocation codec for a deliberately narrow plaintext
+format profile. The encoder writes **only a 16-byte LLC/SNAP + AWDL data header**:
+Apple OUI `00:17:f2`, protocol ID `0x0800`, data header marker `03 04`, caller-owned
+16-bit little-endian sequence, zero padding and big-endian EtherType. It neither
+allocates a sequence nor writes an 802.11 header/payload, dequeues a packet, or
+transmits anything. Output remains untouched on invalid arguments/short capacity.
+
+The decoder accepts a borrowed FCS-free 802.11 ordinary Data or QoS Data frame,
+handles optional QoS HT Control, and checks the AWDL BSSID, LLC/SNAP prefix,
+marker/padding and EtherType. It extracts addresses, sequence and a bounded
+payload range without copying/delivering that payload. Encrypted/fragmented,
+ToDS/FromDS/four-address and A-MSDU frames are unsupported. Other AWDL variants
+need separate evidence and implementation; this is not a universal decoder.
+
+EtherType and payload are opaque: returning a valid wire header does not prove
+IPv6 validity, checksum integrity, peer identity, replay freshness or successful
+AirDrop. The 4096-byte cap is a parser work limit, not an advertised radio MTU.
+The same decoder runs in the existing passive diagnostic observer and tests.
+`AWDL DATA RX` logs consume the existing shared 32-frame budget and do not
+consume, alter, redirect or deliver the original mbuf.
+
+The user requested offline development; no installed kext, EFI file, or boot
+argument was changed. Unit fixtures use invented addresses and byte literals,
+not captures containing real device data.
 
 ## Implemented: opt-in native Tahoe creation and framework-owned teardown
 
@@ -69,14 +96,24 @@ The parser is shared by these tests and the actual receive path. Factory
 policy tests cover opt-in, roles, and invalid MACs. Lifecycle tests exercise
 creation failure/retry, duplicate attempts, pending/refused termination, closing
 during creation, and detach/recreation. They test the actual lifecycle state
-class used by the driver, not an emulation of IOKit callbacks.
+class used by the driver, not an emulation of IOKit callbacks. Data-codec tests
+use independent golden bytes for encode and decode (not just a round-trip),
+including short output buffers, 802.11/QoS/HT truncation, unaligned chained
+buffers, exact 4096-byte bounds, reader failures, unsupported profiles and
+20,000 additional deterministic mutated inputs under ASan/UBSan.
 
 Build with the pinned MacKernelSDK and the commands in the repository README.
 Artifacts stay in `build/`; installing a kext and changing EFI are separate
 hardware validation steps. No hardware validation has been performed for this
 branch. Do not interpret a successful build as verified AWDL interoperability.
 
-## Next dependencies, in order
+## Next dependencies
+
+While installation is deferred, continue offline work on synchronization,
+channel scheduling and firmware queue/station requirements. Hardware creation
+and over-the-air validation remain prerequisites for interoperability claims.
+
+Hardware-dependent path:
 
 1. Validate the native creation experiment on hardware: confirm private-symbol
    binding, request arrival/results, actual BSD registration, child detach and

@@ -68,7 +68,7 @@
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
 #ifdef AIRPORT_WCL
-#include <net80211/awdl_frame.h>
+#include <net80211/awdl_data.h>
 #endif
 
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
@@ -279,12 +279,20 @@ ieee80211_awdl_observe(struct ieee80211com *ic, mbuf_t m,
 {
     struct itl_awdl_reader reader = {m, mbuf_pkthdr_len(m), ieee80211_awdl_read};
     struct itl_awdl_action action;
-    if (itl_awdl_parse_action(&reader, &action) != ITL_AWDL_VALID)
+    if (itl_awdl_parse_action(&reader, &action) == ITL_AWDL_VALID) {
+        --ic->ic_awdl_rx_diag_budget;
+        printf("itlwm: AWDL RX subtype=%u tlvs=%u types=0x%08x rssi=%d remaining=%u\n",
+               (unsigned)action.subtype, (unsigned)action.tlv_count,
+               action.tlv_types, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
+        return;
+    }
+    struct itl_awdl_data data;
+    if (itl_awdl_parse_data(&reader, &data) != ITL_AWDL_VALID)
         return;
     --ic->ic_awdl_rx_diag_budget;
-    printf("itlwm: AWDL RX subtype=%u tlvs=%u types=0x%08x rssi=%d remaining=%u\n",
-           (unsigned)action.subtype, (unsigned)action.tlv_count,
-           action.tlv_types, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
+    printf("itlwm: AWDL DATA RX seq=%u type=0x%04x payload=%lu rssi=%d remaining=%u\n",
+           (unsigned)data.sequence, (unsigned)data.ether_type,
+           (unsigned long)data.payload_length, rxi->rxi_rssi, ic->ic_awdl_rx_diag_budget);
 }
 #endif
 

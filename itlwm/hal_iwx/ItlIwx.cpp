@@ -111,6 +111,7 @@
 #endif
 #include "ItlIwx.hpp"
 #include "iwx_txq_v2.h"
+#include "iwx_flush_v1.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -7209,11 +7210,26 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     return 0;
 }
 
+/* Keep the host-tested decoder tied to the actual firmware response ABI. */
+static_assert(sizeof(struct iwx_tx_path_flush_cmd_rsp) == ITL_IWX_FLUSH_RESPONSE_SIZE &&
+    __offsetof(struct iwx_tx_path_flush_cmd_rsp, sta_id) == 0 &&
+    __offsetof(struct iwx_tx_path_flush_cmd_rsp, num_flushed_queues) == 2 &&
+    __offsetof(struct iwx_tx_path_flush_cmd_rsp, queues) == 4, "flush v1 response ABI");
+static_assert(sizeof(struct iwx_flush_queue_info) == 8 &&
+    __offsetof(struct iwx_flush_queue_info, tid) == 0 &&
+    __offsetof(struct iwx_flush_queue_info, queue_num) == 2 &&
+    __offsetof(struct iwx_flush_queue_info, read_before_flush) == 4 &&
+    __offsetof(struct iwx_flush_queue_info, read_after_flush) == 6, "flush v1 entry ABI");
+static_assert(IWX_TX_FLUSH_QUEUE_RSP == ITL_IWX_FLUSH_QUEUE_LIMIT &&
+    IWX_MAX_TVQM_QUEUES == 512 && IWX_MGMT_TID == 15, "flush decoder profile");
+
 int ItlIwx::
 iwx_flush_sta_tids(struct iwx_softc *sc, int sta_id, uint16_t tids)
 {
     struct iwx_rx_packet *pkt;
-    struct iwx_tx_path_flush_cmd_rsp *resp;
+    struct itl_iwx_flush_response response;
+    enum itl_iwx_flush_result decoded;
+    int32_t data_queues[IWX_MAX_TID_COUNT];
     struct iwx_tx_path_flush_cmd flush_cmd = {
         .sta_id = htole32(sta_id),
         .tid_mask = htole16(tids),
@@ -7223,57 +7239,60 @@ iwx_flush_sta_tids(struct iwx_softc *sc, int sta_id, uint16_t tids)
         .len = { sizeof(flush_cmd), },
         .data = { &flush_cmd, },
         .flags = IWX_CMD_WANT_RESP,
-        .resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
+        .resp_pkt_len = sizeof(*pkt) + sizeof(struct iwx_tx_path_flush_cmd_rsp),
     };
-    int err, resp_len, i, num_flushed_queues;
-    
+    int err, generation = sc->sc_generation;
+#ifdef AIRPORT_VTD
+    uint64_t epoch = dmaEpoch;
+#endif
+
     err = iwx_send_cmd(sc, &hcmd);
     if (err)
         return err;
-    
+    if (generation != sc->sc_generation
+#ifdef AIRPORT_VTD
+        || epoch != dmaEpoch
+#endif
+        ) {
+        err = ENXIO;
+        goto out;
+    }
+
     pkt = hcmd.resp_pkt;
     if (!pkt || (pkt->hdr.group_id & IWX_CMD_FAILED_MSK)) {
         err = EIO;
         goto out;
     }
-    
-    resp_len = iwx_rx_packet_payload_len(pkt);
-    /* Some firmware versions don't provide a response. */
-    if (resp_len == 0)
+    decoded = itl_iwx_flush_decode(pkt->data, iwx_rx_packet_payload_len(pkt),
+        sta_id, tids, &response);
+    /* Preserve the base driver's compatibility with no-payload firmware.
+     * NO_REPLY is not affirmative evidence of drain or queue removal for AWDL.
+     */
+    if (decoded == ITL_IWX_FLUSH_NO_REPLY)
         goto out;
-    else if (resp_len != sizeof(*resp)) {
+    if (decoded != ITL_IWX_FLUSH_OK) {
         err = EIO;
         goto out;
     }
-    
-    resp = (struct iwx_tx_path_flush_cmd_rsp *)pkt->data;
-    
-    if (le16toh(resp->sta_id) != sta_id) {
-        err = EIO;
-        goto out;
-    }
-    
-    num_flushed_queues = le16toh(resp->num_flushed_queues);
-    if (num_flushed_queues > IWX_TX_FLUSH_QUEUE_RSP) {
-        err = EIO;
-        goto out;
-    }
-    
-    for (i = 0; i < num_flushed_queues; i++) {
-        struct iwx_flush_queue_info *queue_info = &resp->queues[i];
-        uint16_t tid = le16toh(queue_info->tid);
-        uint16_t read_after = le16toh(queue_info->read_after_flush);
-        uint16_t qid = le16toh(queue_info->queue_num);
-        struct iwx_tx_ring *txq;
-        
-        if (qid >= nitems(sc->txq))
-            continue;
 
-        if (sc->sc_tid_data[tid].qid != qid)
+    /* This table describes the AP station only; an AWDL station will need
+     * its own serialized owner lookup rather than borrowing these bindings.
+     */
+    if (sta_id != IWX_STATION_ID)
+        goto out;
+    for (unsigned tid = 0; tid < ARRAY_SIZE(data_queues); ++tid)
+        data_queues[tid] = sc->sc_tid_data[tid].qid;
+    for (unsigned i = 0; i < response.count; ++i) {
+        const struct itl_iwx_flush_entry *entry = &response.entries[i];
+        struct iwx_tx_ring *txq;
+        if (!itl_iwx_flush_binding_matches(entry->tid, entry->queue,
+            data_queues, ARRAY_SIZE(data_queues), sc->first_data_qid))
             continue;
-        txq = &sc->txq[qid];
-        
-        iwx_ampdu_txq_advance(sc, txq, IWX_AGG_SSN_TO_TXQ_IDX(read_after, txq->ring_count));
+        txq = &sc->txq[entry->queue];
+        if (!txq->ring_count)
+            continue;
+        iwx_ampdu_txq_advance(sc, txq,
+            IWX_AGG_SSN_TO_TXQ_IDX(entry->read_after, txq->ring_count));
     }
 out:
     iwx_free_resp(sc, &hcmd);

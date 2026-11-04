@@ -223,3 +223,13 @@ epoch/lease/operation tickets, ordered teardown and fail-closed quarantine for
 uncertain outcomes. It is independent of the driver. Integration still requires
 a central allocator, command/version negotiation, real firmware completion and
 DMA/reset fencing. C11/C++11 sanitizer tests exercise its actual transitions.
+
+
+## Flush reply and teardown evidence
+
+The existing IWX flush handler now uses the tested legacy reply decoder and
+bounds-checked management/data queue binding helper. It validates all entries
+before updating rings and distinguishes no-payload compatibility from positive
+queue evidence. See [flush validation and removal investigation](flush-evidence.md)
+for the TID bounds finding, integration details and unresolved firmware removal
+profile. This does not activate AWDL commands or the resource ledger.

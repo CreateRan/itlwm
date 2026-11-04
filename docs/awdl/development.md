@@ -262,3 +262,13 @@ matching explicit queue flush evidence and a separately validated host fence.
 Every stage retains the original resource ticket; firmware acknowledgements alone
 do not finish the ledger drain. It is compiled and host-tested without enabling
 hardware dispatch or claiming real TX/DMA quiescence.
+
+
+## Compiled command exchange
+
+The [disabled kernel exchange entry](command-exchange.md) now uses the existing
+synchronous command transport with shared request/frame checks, original ticket
+validation and a stop epoch in all builds. It preserves legacy wire-ID handling
+rather than encoding layout versions into command headers. There is no activation
+path, new command caller or live TX/DMA claim; lifecycle pinning, binding setup
+and hardware fencing still precede any future enablement.

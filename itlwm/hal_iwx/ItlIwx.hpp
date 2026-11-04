@@ -141,6 +141,11 @@
 #include <HAL/ItlDriverInfo.hpp>
 #include <HAL/ItlDriverController.hpp>
 
+struct itl_iwx_awdl_resources;
+struct itl_iwx_station_request;
+struct itl_iwx_exchange_epoch;
+struct itl_iwx_exchange_reply;
+
 class ItlIwx : public ItlHalService, ItlDriverInfo, ItlDriverController {
     OSDeclareDefaultStructors(ItlIwx)
     
@@ -361,6 +366,9 @@ public:
     int    iwx_phy_ctxt_cmd(struct iwx_softc *, struct iwx_phy_ctxt *, uint8_t,
             uint8_t, uint32_t, uint32_t);
     int    iwx_send_cmd(struct iwx_softc *, struct iwx_host_cmd *);
+    int iwx_awdl_exchange(struct iwx_softc *, struct itl_iwx_awdl_resources *,
+        const struct itl_iwx_exchange_epoch *, const struct itl_iwx_station_request *,
+        struct itl_iwx_exchange_reply *);
     int    iwx_wait_notification(struct iwx_softc *, int *, int, uint32_t);
     int    iwx_send_cmd_pdu(struct iwx_softc *, uint32_t, uint32_t, uint16_t,
             const void *);
@@ -491,6 +499,11 @@ public:
     IOInterruptEventSource* fInterrupt;
     struct pci_attach_args pci;
     struct iwx_softc com;
+private:
+    // No setter/boot argument/caller: transport remains unavailable this increment.
+    bool awdlTransportEnabled = false;
+    bool awdlTransportBusy = false;
+    uint64_t awdlCommandEpoch = 1;
 };
 
 #endif

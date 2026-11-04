@@ -114,6 +114,7 @@
 #include "iwx_flush_v1.h"
 #include "iwx_station_adapter.h"
 #include "iwx_drain_adapter.h"
+#include "iwx_command_exchange.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -3281,6 +3282,9 @@ iwx_stop_device(struct iwx_softc *sc)
         return;
     }
 
+    // All builds invalidate experimental exchange bindings on every device stop.
+    // Zero is permanently exhausted, never a reusable wrapped incarnation.
+    awdlCommandEpoch = itl_iwx_exchange_next_epoch(awdlCommandEpoch);
 #ifdef AIRPORT_VTD
     dmaEpoch++;
 #endif
@@ -6749,6 +6753,70 @@ out:
         sc->sc_cmd_resp_len[idx] = 0;
     }
     return err;
+}
+
+/* Compiled experimental transport. No activation path exists: the private
+ * enable flag is initialized false and has no setter or boot argument.
+ * Caller must pin this controller and ledger across commandSleep, serialize
+ * orchestration, and supply a binding established for this driver incarnation.
+ */
+int ItlIwx::
+iwx_awdl_exchange(struct iwx_softc *sc, struct itl_iwx_awdl_resources *pool,
+    const struct itl_iwx_exchange_epoch *binding, const struct itl_iwx_station_request *request,
+    struct itl_iwx_exchange_reply *out)
+{
+    if (!out) return EINVAL;
+    memset(out,0,sizeof(*out));
+    if (!awdlTransportEnabled) return EOPNOTSUPP;
+    if (sc != &com || !pool || !binding || !request) return EINVAL;
+    if (!getMainWorkLoop()->inGate()) return EWOULDBLOCK;
+    if (awdlTransportBusy) return EBUSY;
+    if (!awdlCommandEpoch || (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR))) return ENXIO;
+#ifdef AIRPORT_VTD
+    if (dmaDetaching) return ENXIO;
+#endif
+    struct iwx_tx_ring *ring = &sc->txq[IWX_DQA_CMD_QUEUE];
+    if (ring->qid != IWX_DQA_CMD_QUEUE || !ring->desc || !ring->cmd || ring->cur < 0 ||
+        ring->ring_count < 8 || ring->ring_count > 256 || (ring->ring_count & (ring->ring_count-1)))
+        return ENXIO;
+    // Own copies remain stable while commandSleep releases the gate.
+    const struct itl_iwx_station_request command = *request;
+    const struct itl_iwx_exchange_epoch bound = *binding;
+    struct itl_iwx_exchange_epoch current = {pool->epoch,sc->sc_generation,awdlCommandEpoch,0};
+#ifdef AIRPORT_VTD
+    current.dma_epoch = dmaEpoch;
+#endif
+    struct itl_iwx_exchange_plan plan;
+    enum itl_iwx_awdl_resource_result checked = itl_iwx_exchange_prepare(pool,&command,&bound,&current,
+        (unsigned)ring->cur & (ring->ring_count-1),
+        iwx_lookup_cmd_ver(sc,IWX_LONG_GROUP,command.opcode),
+        iwx_lookup_notif_ver(sc,IWX_LONG_GROUP,command.opcode),&plan);
+    if (checked != ITL_IWX_RESOURCE_OK)
+        return checked == ITL_IWX_RESOURCE_STALE ? ENXIO : checked == ITL_IWX_RESOURCE_FAULT ? EIO : EINVAL;
+    struct iwx_host_cmd hcmd = {};
+    hcmd.id = plan.host_command_id; // Bare opcode: preserves legacy RX association and wire version 0.
+    hcmd.flags = IWX_CMD_WANT_RESP;
+    hcmd.data[0] = command.bytes; hcmd.len[0] = command.length;
+    hcmd.resp_pkt_len = sizeof(struct iwx_rx_packet) + plan.payload_length;
+    awdlTransportBusy = true;
+    int err = iwx_send_cmd(sc,&hcmd);
+    awdlTransportBusy = false;
+    // On errors/reset send_cmd retains/frees its own old response buffers.
+    if (err) return err;
+    current.ledger_epoch = pool->epoch; current.driver_generation = sc->sc_generation;
+    current.transport_epoch = awdlCommandEpoch;
+#ifdef AIRPORT_VTD
+    current.dma_epoch = dmaEpoch;
+#endif
+    // Fault/detach may be observed before reset advances an incarnation field.
+    int transport_error = (sc->sc_flags & (IWX_FLAG_SHUTDOWN | IWX_FLAG_HW_ERR)) ? ENXIO : 0;
+#ifdef AIRPORT_VTD
+    if (dmaDetaching) transport_error = ENXIO;
+#endif
+    checked = itl_iwx_exchange_capture(pool,&plan,&current,transport_error,hcmd.resp_pkt,hcmd.resp_pkt_len,out);
+    iwx_free_resp(sc,&hcmd);
+    if (transport_error) return transport_error;
+    return checked == ITL_IWX_RESOURCE_OK ? 0 : checked == ITL_IWX_RESOURCE_STALE ? ENXIO : EIO;
 }
 
 int ItlIwx::

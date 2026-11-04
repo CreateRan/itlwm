@@ -68,3 +68,10 @@ xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
     -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
     -fno-omit-frame-pointer -g -I. tests/iwx_drain_adapter_test.c -o "$test_dir/iwx-drain-adapter-cxx-tests"
 "$test_dir/iwx-drain-adapter-cxx-tests"
+xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_command_exchange_test.c -o "$test_dir/iwx-command-exchange-tests"
+"$test_dir/iwx-command-exchange-tests"
+xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
+    -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/iwx_command_exchange_test.c -o "$test_dir/iwx-command-exchange-cxx-tests"
+"$test_dir/iwx-command-exchange-cxx-tests"

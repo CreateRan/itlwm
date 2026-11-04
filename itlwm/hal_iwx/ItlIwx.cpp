@@ -110,6 +110,7 @@
 #include "../../AirportItlwm/WCL/WCL.hpp"
 #endif
 #include "ItlIwx.hpp"
+#include "iwx_txq_v2.h"
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -3423,6 +3424,21 @@ const uint8_t iwx_ac_to_tx_fifo[] = {
     IWX_GEN2_EDCA_TX_FIFO_VO,
 };
 
+/* Keep the tested byte codec tied to the firmware structures used here. */
+static_assert(sizeof(struct iwx_tx_queue_cfg_cmd) == ITL_IWX_TXQ_V2_REQUEST_SIZE, "TXQ v2 request ABI");
+static_assert(__offsetof(struct iwx_tx_queue_cfg_cmd, sta_id) == 0 &&
+    __offsetof(struct iwx_tx_queue_cfg_cmd, tid) == 1 &&
+    __offsetof(struct iwx_tx_queue_cfg_cmd, flags) == 2 &&
+    __offsetof(struct iwx_tx_queue_cfg_cmd, cb_size) == 4 &&
+    __offsetof(struct iwx_tx_queue_cfg_cmd, byte_cnt_addr) == 8 &&
+    __offsetof(struct iwx_tx_queue_cfg_cmd, tfdq_addr) == 16, "TXQ v2 request fields");
+static_assert(IWX_TX_QUEUE_CFG_ENABLE_QUEUE == 1, "TXQ enable flag ABI");
+static_assert(sizeof(struct iwx_tx_queue_cfg_rsp) == ITL_IWX_TXQ_V2_RESPONSE_SIZE &&
+    __offsetof(struct iwx_tx_queue_cfg_rsp, queue_number) == 0 &&
+    __offsetof(struct iwx_tx_queue_cfg_rsp, flags) == 2 &&
+    __offsetof(struct iwx_tx_queue_cfg_rsp, write_pointer) == 4 &&
+    __offsetof(struct iwx_tx_queue_cfg_rsp, reserved) == 6, "TXQ v2 response ABI");
+
 int ItlIwx::
 iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
                int num_slots)
@@ -3431,27 +3447,24 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     XYLog("%s\n", __FUNCTION__);
     struct iwx_tx_queue_cfg_cmd cmd;
     struct iwx_rx_packet *pkt;
-    struct iwx_tx_queue_cfg_rsp *resp;
+    struct itl_iwx_txq_v2_response response;
     struct iwx_host_cmd hcmd = {
         .id = IWX_SCD_QUEUE_CFG,
         .flags = IWX_CMD_WANT_RESP,
-        .resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
+        .resp_pkt_len = sizeof(*pkt) + sizeof(struct iwx_tx_queue_cfg_rsp),
     };
+    if (qid < 0 || (unsigned)qid >= ARRAY_SIZE(sc->txq))
+        return EINVAL;
     struct iwx_tx_ring *ring = &sc->txq[qid];
     int err, fwqid;
     uint32_t wr_idx;
     size_t resp_len;
     
+    if (itl_iwx_txq_v2_encode(&cmd, sizeof(cmd), sta_id, tid, num_slots,
+        ring->bc_tbl.paddr, ring->desc_dma.paddr) != ITL_IWX_TXQ_V2_OK)
+        return EINVAL;
     iwx_reset_tx_ring(sc, ring);
-    
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.sta_id = sta_id;
-    cmd.tid = tid;
-    cmd.flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE);
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(num_slots));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
-    
+
     hcmd.data[0] = &cmd;
     hcmd.len[0] = sizeof(cmd);
     
@@ -3467,15 +3480,19 @@ iwx_enable_txq(struct iwx_softc *sc, int sta_id, int qid, int tid,
     }
     
     resp_len = iwx_rx_packet_payload_len(pkt);
-    if (resp_len != sizeof(*resp)) {
-        DPRINTF(("SCD_QUEUE_CFG returned %zu bytes, expected %zu bytes\n", resp_len, sizeof(*resp)));
+    if (resp_len != sizeof(struct iwx_tx_queue_cfg_rsp)) {
+        DPRINTF(("SCD_QUEUE_CFG returned %zu bytes, expected %zu bytes\n", resp_len, sizeof(struct iwx_tx_queue_cfg_rsp)));
         err = EIO;
         goto out;
     }
     
-    resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
-    fwqid = le16toh(resp->queue_number);
-    wr_idx = le16toh(resp->write_pointer);
+    if (itl_iwx_txq_v2_decode(pkt->data, resp_len, &response) != ITL_IWX_TXQ_V2_OK) {
+        DPRINTF(("SCD_QUEUE_CFG firmware rejected queue configuration\n"));
+        err = EIO;
+        goto out;
+    }
+    fwqid = response.queue_number;
+    wr_idx = response.write_pointer;
     
     /* Unlike iwlwifi, we do not support dynamic queue ID assignment. */
     if (fwqid != qid) {
@@ -3542,6 +3559,8 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
         return -EINVAL;
     uint64_t epoch = dmaEpoch;
 #endif
+    if (!itl_iwx_txq_v2_parameters_valid(IWX_STATION_ID, tid, size))
+        return -EINVAL;
     int err = -1;
 #ifdef AIRPORT_VTD
     bool submitted = false;
@@ -3551,17 +3570,13 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     int fwqid;
     uint32_t wr_idx;
     size_t resp_len;
-    struct iwx_tx_queue_cfg_cmd cmd = {
-        .flags = htole16(IWX_TX_QUEUE_CFG_ENABLE_QUEUE),
-        .sta_id = IWX_STATION_ID,
-        .tid = (uint8_t)tid,
-    };
+    struct iwx_tx_queue_cfg_cmd cmd;
     struct iwx_rx_packet *pkt;
-    struct iwx_tx_queue_cfg_rsp *resp;
+    struct itl_iwx_txq_v2_response response;
     struct iwx_host_cmd hcmd = {
         .id = IWX_SCD_QUEUE_CFG,
         .flags = IWX_CMD_WANT_RESP,
-        .resp_pkt_len = sizeof(*pkt) + sizeof(*resp),
+        .resp_pkt_len = sizeof(*pkt) + sizeof(struct iwx_tx_queue_cfg_rsp),
     };
 #ifdef AIRPORT_VTD
     auto ring = new iwx_tx_ring();
@@ -3620,9 +3635,11 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
             goto fail;
         }
     }
-    cmd.cb_size = htole32(IWX_TFD_QUEUE_CB_SIZE(ring->ring_count));
-    cmd.byte_cnt_addr = htole64(ring->bc_tbl.paddr);
-    cmd.tfdq_addr = htole64(ring->desc_dma.paddr);
+    if (itl_iwx_txq_v2_encode(&cmd, sizeof(cmd), IWX_STATION_ID, tid,
+        ring->ring_count, ring->bc_tbl.paddr, ring->desc_dma.paddr) != ITL_IWX_TXQ_V2_OK) {
+        err = -EINVAL;
+        goto fail;
+    }
 
     hcmd.data[0] = &cmd;
     hcmd.len[0] = sizeof(cmd);
@@ -3648,15 +3665,19 @@ iwx_tvqm_enable_txq(struct iwx_softc *sc, int tid, int ssn, uint32_t size)
     }
 
     resp_len = iwx_rx_packet_payload_len(pkt);
-    if (resp_len != sizeof(*resp)) {
-        XYLog("SCD_QUEUE_CFG returned %zu bytes, expected %zu bytes\n", resp_len, sizeof(*resp));
+    if (resp_len != sizeof(struct iwx_tx_queue_cfg_rsp)) {
+        XYLog("SCD_QUEUE_CFG returned %zu bytes, expected %zu bytes\n", resp_len, sizeof(struct iwx_tx_queue_cfg_rsp));
         err = -EIO;
         goto fail;
     }
 
-    resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
-    fwqid = le16toh(resp->queue_number);
-    wr_idx = le16toh(resp->write_pointer);
+    if (itl_iwx_txq_v2_decode(pkt->data, resp_len, &response) != ITL_IWX_TXQ_V2_OK) {
+        XYLog("SCD_QUEUE_CFG firmware rejected queue configuration\n");
+        err = -EIO;
+        goto fail;
+    }
+    fwqid = response.queue_number;
+    wr_idx = response.write_pointer;
     if (fwqid >= ARRAY_SIZE(sc->txq)) {
         XYLog("queue index %d unsupported", fwqid);
         err = -EIO;

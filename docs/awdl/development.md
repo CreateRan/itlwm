@@ -204,3 +204,13 @@ Wire-format reference (facts only; implementation is written independently):
 and [OWL receive path](https://github.com/seemoo-lab/owl/blob/master/src/rx.c).
 See also [upstream AWDL investigation](https://github.com/OpenIntelWireless/itlwm/issues/1062)
 for reports of virtual interfaces without a working Intel hardware data path.
+
+
+## IWX backend groundwork
+
+The [firmware backend investigation](iwx-backend.md) maps the shared MAC/PHY,
+station, queue and time-event state that prevents directly reusing the current
+Wi-Fi path for concurrent AWDL. The legacy queue-v2 codec is integrated into
+both existing IWX queue configuration handlers. It adds strict failure-flag
+rejection and bounds/argument validation, with independent wire fixtures in
+C11/C++11 under ASan/UBSan. It does not activate an AWDL hardware path.

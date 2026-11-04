@@ -51,6 +51,10 @@ extern "C" {
 const char *convertApple80211IOCTLToString(signed int cmd);
 }
 
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+#include "AWDL/InterfaceLifecycle.hpp"
+#endif
+
 class AirportItlwm : public IO80211Controller {
     OSDeclareDefaultStructors(AirportItlwm)
 #define IOCTL(REQ_TYPE, REQ, DATA_TYPE) \
@@ -145,7 +149,18 @@ public:
     }
     
 #if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
-    // Factory-only prototype. No native setter attaches or owns this object yet.
+    virtual bool willTerminate(IOService *, IOOptionBits) override;
+    IOReturn createExperimentalAWDL(apple80211_virt_if_create_data *);
+    static IOReturn createExperimentalAWDLGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn createExperimentalAWDLRequestGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn openAWDLSessionGated(OSObject *, void *, void *, void *, void *);
+    static IOReturn takeAWDLReferenceGated(OSObject *, void *, void *, void *, void *);
+    void releaseAWDLReferenceAfterFrameworkStop();
+    bool experimentalAWDLNativeEnabled = false;
+    uint32_t experimentalAWDLRequestLogBudget = 16;
+    AirportAWDL::InterfaceLifecycle experimentalAWDLLifecycle;
+    IO80211VirtualInterface *experimentalAWDL = nullptr;
+    uint8_t experimentalAWDLAddress[6] = {};
     virtual IO80211VirtualInterface *createVirtualInterface(ether_addr *, unsigned int) override;
     static IOReturn disableAWDLFactoryGated(OSObject *, void *, void *, void *, void *);
     void disableAWDLFactory();

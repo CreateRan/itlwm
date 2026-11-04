@@ -1076,3 +1076,10 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
     return kIOReturnUnsupported;
 }
 #endif
+
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+IOReturn AirportItlwmSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
+{
+    return instance ? instance->createExperimentalAWDL(data) : kIOReturnNotReady;
+}
+#endif

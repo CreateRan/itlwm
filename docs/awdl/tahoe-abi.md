@@ -34,12 +34,35 @@ Skywalk base type, and calls the exact exported initializer. This avoids a
 guessed object size, a legacy class declaration, and hard-coded virtual calls.
 It returns the same initialized/unattached +1 ownership as the system factory.
 
-The native create setter remains unsupported: no attachment caller has been
-introduced. Code review rejected driver-owned attachment because failed child
-termination was followed by controller/HAL teardown. Keeping the factory
-separate allows the ownership contract to be designed before this is wired to
-native creation. The opt-in `itlwm_awdl_factory=1` alone creates no interface.
+The native creation experiment (`itlwm_awdl_vif=1`) now uses a direct child of
+the controller. It does not synchronously terminate that child in controller
+stop. See the framework lifecycle evidence below. Factory-only mode is still
+available via `itlwm_awdl_factory=1`; the latter alone enables no native setter.
 
 None of these observations supplies Intel firmware queue/station/channel
 binding or the native peer data path. Creating a system AWDL interface alone
 cannot make AirDrop work. The factory prototype remains untested on hardware.
+
+## Framework lifecycle evidence
+
+Reviewed public source:
+[`IOService.cpp` at f6217f8](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/iokit/Kernel/IOService.cpp).
+This source was inspected for IOService semantics; it is not claimed to be an
+exact source reconstruction of every private component in local build 25G332.
+
+- `attach()` checks provider inactive state under arbitration before attaching.
+  A child cannot be attached after provider termination has marked it inactive.
+- Parent finalization is scheduled only after its service-plane clients detach.
+- `terminateWorker()` defers stopping an inactive service until it is finalized.
+- Scheduling uses service state and registry links, not allocation reference
+  counts; holding the original child reference does not prevent its detach.
+
+The driver therefore stops accepting creation in `willTerminate`, relies on
+framework child teardown, and releases its original reference at controller
+stop before releasing HAL. A refusing/pending child prevents normal parent
+finalization, keeping controller resources alive. No retry-and-continue
+termination path or synchronous child wait is retained.
+
+The pure lifecycle state is tested with failed creation, in-flight quiescence,
+pending/refused child termination, detach and recreation. These tests cannot
+prove the private child's callbacks, correct registration, or real AirDrop.

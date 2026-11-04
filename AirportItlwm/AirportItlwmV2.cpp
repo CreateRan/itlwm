@@ -344,9 +344,13 @@ bool AirportItlwm::start(IOService *provider)
 
 #ifdef AIRPORT_WCL
 #if __IO80211_TARGET == __MAC_26_0
+    int awdl_native = 0;
+    experimentalAWDLNativeEnabled = PE_parse_boot_argn("itlwm_awdl_vif", &awdl_native,
+        sizeof(awdl_native)) && awdl_native == 1;
     int awdl_factory = 0;
     experimentalAWDLFactoryEnabled = PE_parse_boot_argn("itlwm_awdl_factory", &awdl_factory,
         sizeof(awdl_factory)) && awdl_factory == 1;
+    experimentalAWDLFactoryEnabled |= experimentalAWDLNativeEnabled;
 #endif
     int awdl_diag = 0;
     auto ic = fHalService->get80211Controller();
@@ -489,6 +493,11 @@ bool AirportItlwm::start(IOService *provider)
     bsdInterface->registerService();
 #endif
     registerService();
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+    // All startup failure paths precede this point. IOService serializes its
+    // own start/termination; also reject a provider already marked inactive.
+    _fCommandGate->runAction(openAWDLSessionGated);
+#endif
     return true;
 }
 
@@ -496,6 +505,7 @@ void AirportItlwm::stop(IOService *provider)
 {
 #if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
     disableAWDLFactory();
+    releaseAWDLReferenceAfterFrameworkStop();
 #endif
     XYLog("%s\n", __PRETTY_FUNCTION__);XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
@@ -1429,8 +1439,7 @@ IO80211VirtualInterface *AirportItlwm::createVirtualInterface(ether_addr *addres
         object->release();
         return nullptr;
     }
-    // Match the base controller factory contract: initialized, unattached,
-    // +1 ownership. The future attachment caller must own the whole lifecycle.
+    // Match the base controller factory contract: initialized, unattached, +1 ownership.
     return reinterpret_cast<IO80211VirtualInterface *>(interface);
 }
 
@@ -1438,7 +1447,10 @@ IOReturn AirportItlwm::disableAWDLFactoryGated(OSObject *owner, void *, void *, 
 {
     auto self = OSDynamicCast(AirportItlwm, owner);
     if (!self) return kIOReturnBadArgument;
+    if (self->experimentalAWDLLifecycle.accepting())
+        IOLog("itlwm: AWDL lifecycle quiescing\n");
     self->experimentalAWDLFactoryEnabled = false;
+    self->experimentalAWDLLifecycle.quiesce();
     return kIOReturnSuccess;
 }
 
@@ -1448,5 +1460,126 @@ void AirportItlwm::disableAWDLFactory()
         _fCommandGate->runAction(disableAWDLFactoryGated);
     else
         experimentalAWDLFactoryEnabled = false;
+}
+#endif
+
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+bool AirportItlwm::willTerminate(IOService *provider, IOOptionBits options)
+{
+    disableAWDLFactory();
+    return super::willTerminate(provider, options);
+}
+
+IOReturn AirportItlwm::openAWDLSessionGated(OSObject *owner, void *, void *, void *, void *)
+{
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    if (!self) return kIOReturnBadArgument;
+    if (!self->experimentalAWDLNativeEnabled || self->isInactive()) return kIOReturnNotReady;
+    if (!self->experimentalAWDLLifecycle.open()) return kIOReturnBusy;
+    IOLog("itlwm: AWDL native lifecycle experiment ready; transport unavailable\n");
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwm::createExperimentalAWDL(apple80211_virt_if_create_data *request)
+{
+    if (!request) return kIOReturnBadArgument;
+    if (!experimentalAWDLNativeEnabled) return kIOReturnUnsupported;
+    if (!_fCommandGate) return kIOReturnNotReady;
+    return _fCommandGate->runAction(createExperimentalAWDLGated, request);
+}
+
+IOReturn AirportItlwm::createExperimentalAWDLGated(
+    OSObject *owner, void *arg, void *, void *, void *)
+{
+    IOReturn result = createExperimentalAWDLRequestGated(owner, arg, nullptr, nullptr, nullptr);
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    auto request = static_cast<apple80211_virt_if_create_data *>(arg);
+    if (self && request && self->experimentalAWDLRequestLogBudget) {
+        --self->experimentalAWDLRequestLogBudget;
+        IOLog("itlwm: AWDL create role=%u result=0x%08x remaining=%u\n",
+            request->role, (unsigned)result, self->experimentalAWDLRequestLogBudget);
+    }
+    return result;
+}
+
+IOReturn AirportItlwm::createExperimentalAWDLRequestGated(
+    OSObject *owner, void *arg, void *, void *, void *)
+{
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    auto request = static_cast<apple80211_virt_if_create_data *>(arg);
+    if (!self || !request) return kIOReturnBadArgument;
+    static_assert(sizeof(apple80211_virt_if_create_data) == 32, "Native AWDL create request size");
+    if (!self->experimentalAWDLLifecycle.accepting() || self->isInactive()) return kIOReturnNotReady;
+    if (request->version != 1) return kIOReturnBadArgument;
+    auto plan = AirportAWDL::planFactory(self->experimentalAWDLFactoryEnabled,
+        request->role, request->mac);
+    if (plan == AirportAWDL::FactoryPlan::Invalid) return kIOReturnBadArgument;
+    if (plan != AirportAWDL::FactoryPlan::Create) return kIOReturnUnsupported;
+
+    if (self->experimentalAWDL) {
+        auto interface = reinterpret_cast<IO80211SkywalkInterface *>(self->experimentalAWDL);
+        if (interface->getProvider() != self) {
+            // Framework detached this child while the controller stayed live.
+            self->experimentalAWDL = nullptr;
+            self->experimentalAWDLLifecycle.childDetached();
+            interface->release();
+        } else if (interface->isInactive()) {
+            // Keep ownership until framework detach; do not reuse or replace
+            // an independently terminating child while it is still attached.
+            return kIOReturnNotReady;
+        } else if (memcmp(self->experimentalAWDLAddress, request->mac, 6)) {
+            return kIOReturnBusy;
+        }
+    }
+    if (!self->experimentalAWDL) {
+        if (!self->experimentalAWDLLifecycle.beginCreate()) return kIOReturnBusy;
+        ether_addr address;
+        memcpy(address.octet, request->mac, sizeof(address.octet));
+        IO80211VirtualInterface *interface = nullptr;
+        // Direct service-plane child: IOKit owns stop/detach ordering. Do not
+        // force synchronous child termination from controller stop().
+        bool attached = self->attachVirtualInterface(&interface, &address, request->role, false);
+        self->experimentalAWDLLifecycle.completeCreate(attached);
+        if (!attached) return kIOReturnNoResources;
+        self->experimentalAWDL = interface;
+        memcpy(self->experimentalAWDLAddress, request->mac, 6);
+        if (!self->isInactive())
+            reinterpret_cast<IO80211SkywalkInterface *>(interface)->registerService();
+        IOLog("itlwm: experimental native AWDL child attached; radio data path unavailable\n");
+    }
+    if (self->isInactive() || !self->experimentalAWDLLifecycle.accepting()) return kIOReturnNotReady;
+    auto interface = reinterpret_cast<const IO80211SkywalkInterface *>(self->experimentalAWDL);
+    if (interface->isInactive()) return kIOReturnNotReady;
+    const char *name = interface->getBSDName();
+    if (!name || !name[0]) return kIOReturnNotReady;
+    strlcpy(reinterpret_cast<char *>(request->bsd_name), name, sizeof(request->bsd_name));
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwm::takeAWDLReferenceGated(OSObject *owner, void *arg, void *, void *, void *)
+{
+    auto self = OSDynamicCast(AirportItlwm, owner);
+    if (!self || !arg) return kIOReturnBadArgument;
+    self->experimentalAWDLLifecycle.quiesce();
+    // IOService::terminateWorker invokes controller stop only after its direct
+    // service-plane clients have detached. No child termination is issued here.
+    if (self->experimentalAWDL) {
+        auto interface = reinterpret_cast<IO80211SkywalkInterface *>(self->experimentalAWDL);
+        IOLog("itlwm: AWDL framework stop childAttached=%u\n",
+            unsigned(interface->getProvider() == self));
+    }
+    *static_cast<IO80211VirtualInterface **>(arg) = self->experimentalAWDL;
+    self->experimentalAWDL = nullptr;
+    self->experimentalAWDLLifecycle.childDetached();
+    return kIOReturnSuccess;
+}
+
+void AirportItlwm::releaseAWDLReferenceAfterFrameworkStop()
+{
+    IO80211VirtualInterface *interface = nullptr;
+    if (_fCommandGate)
+        _fCommandGate->runAction(takeAWDLReferenceGated, &interface);
+    if (interface)
+        reinterpret_cast<IO80211SkywalkInterface *>(interface)->release();
 }
 #endif

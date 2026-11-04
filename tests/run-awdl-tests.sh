@@ -25,3 +25,10 @@ xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
     -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
     -fno-omit-frame-pointer -g -I. tests/awdl_peers_test.c -o "$test_dir/awdl-peers-cxx-tests"
 "$test_dir/awdl-peers-cxx-tests"
+xcrun clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/awdl_overlap_test.c -o "$test_dir/awdl-overlap-tests"
+"$test_dir/awdl-overlap-tests"
+xcrun clang++ -x c++ -std=c++11 -Wall -Wextra -Werror \
+    -Wno-missing-braces -Wno-missing-field-initializers -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -g -I. tests/awdl_overlap_test.c -o "$test_dir/awdl-overlap-cxx-tests"
+"$test_dir/awdl-overlap-cxx-tests"

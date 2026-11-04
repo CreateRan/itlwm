@@ -75,7 +75,7 @@ Protocol facts were checked against [OWL frame layout](https://github.com/seemoo
 and [synchronization semantics](https://github.com/seemoo-lab/owl/blob/master/src/sync.c).
 The implementation is independent; no reference implementation body is copied.
 
-Run `sh tests/run-awdl-tests.sh` for all six ASan/UBSan suites. Hand-encoded
+Run `sh tests/run-awdl-tests.sh` for all seven ASan/UBSan suites. Hand-encoded
 fixtures provide independent expected fields/timing values. Tests cover split
 and unaligned readers, truncated/conflicting TLVs, HT Control, clock reversal,
 staleness, exact boundaries, sequence/counter wrap, zero time, UINT64_MAX and

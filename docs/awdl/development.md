@@ -96,6 +96,20 @@ chooses a replacement, trusts a sender or adopts a clock. Clear preserves the
 local identity/time watermark. See [peer-state contract](peer-state.md) for the
 sequence-reset, clock, expiry and security limits.
 
+## Implemented offline: guarded nominal overlap candidates
+
+`awdl_overlap.h` searches two caller-provided snapshots for matching nonzero
+channel/operating-class identifiers. Independent caller-provided guards trim
+both sides of each nominal AW. The whole requested transaction must fit, and
+the search is clipped to both freshness deadlines, the caller horizon and
+clock headroom. A fixed 128-segment budget bounds work and returns LIMIT rather
+than claiming no later window exists.
+
+This is a pure encoding-3 candidate calculator: no master choice, clock
+adoption, reservation, timer, firmware operation or live integration. Identifier
+equality is not regulatory/firmware eligibility. It does not merge adjacent
+AWs or estimate airtime/guard uncertainty. See [overlap contract](overlap-planner.md).
+
 ## Implemented: opt-in native Tahoe creation and framework-owned teardown
 
 `itlwm_awdl_vif=1` opts into the native creation experiment and enables its
@@ -151,7 +165,10 @@ cover bounded admission, duplicate/wrap ordering, independent ages, explicit
 selection, removal/expiry, clock limits, partial updates and 10,000 state
 transitions. The peer suite runs as both C11 and C++11 under ASan/UBSan.
 The new table is not integrated into the current driver; no kernel build or
-live deployment is claimed for this table increment.
+live deployment is claimed for this table increment. The overlap suite adds
+literal boundary cases and an independent per-microsecond oracle over 1,000
+parameter combinations; it runs as C11 and C++11 under ASan/UBSan. No driver
+build or deployment is claimed for the independent overlap module.
 
 Build with the pinned MacKernelSDK and the commands in the repository README.
 Artifacts stay in `build/`; installing a kext and changing EFI are separate

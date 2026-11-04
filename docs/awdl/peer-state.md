@@ -76,7 +76,7 @@ but unusable until a fresh complete observation arrives or it is removed.
 - Future kernel integration needs explicit storage/gate/lifecycle ownership and
   admission/trust policy. No peer table is allocated on a kernel stack here.
 
-Run `sh tests/run-awdl-tests.sh`: six distinct suites, with the peer suite also
+Run `sh tests/run-awdl-tests.sh`: seven distinct suites, with peer and overlap suites also
 compiled as C++11. The C++ check matches the kernel target's diagnostics for C
 aggregate zero initialization. Both language runs use ASan/UBSan. Tests cover
 capacity, wrap/half-range ordering, independent snapshot age, partial updates,

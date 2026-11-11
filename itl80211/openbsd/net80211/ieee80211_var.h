@@ -493,6 +493,10 @@ struct ieee80211com {
     uint32_t        ic_awdl_roc_end_fail_last_us;
     uint32_t        ic_awdl_roc_chan_changes;
     uint32_t        ic_awdl_roc_band_changes;
+    /* Dwells held off because the station was pushing traffic (en1 TX). */
+    uint32_t        ic_awdl_tx_hold_skips;
+    uint32_t        ic_awdl_tx_hold_forced;  /* let through by the hold cap */
+    uint64_t        ic_awdl_sta_tx_bytes;    /* station TX seen by the driver */
     /* Every frame delivered while an aux ROC is between START and END. */
     uint32_t        ic_awdl_roc_rx_target;   /* on the ROC channel */
     uint32_t        ic_awdl_roc_rx_home;     /* on the station channel */

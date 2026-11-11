@@ -770,6 +770,20 @@ struct iwx_softc {
 	uint32_t sc_aux_roc_started;
 	uint32_t sc_aux_roc_ended;
 	uint32_t sc_aux_roc_not_sched;
+	/*
+	 * Station TX activity, used to hold the AWDL off-channel dwell while a
+	 * real transfer is in flight (see iwx_sta_tx_busy in ItlIwx.cpp).  With
+	 * the dwell running the station's TX direction stalls: 0.2-1 MB/s to a
+	 * peer with the dwell on the air vs 28-35 MB/s with AWDL off, RX
+	 * unaffected.
+	 */
+	uint64_t sc_sta_tx_bytes;	/* total bytes handed to iwx_tx */
+	uint64_t sc_sta_tx_win_us;	/* start of the current rate window */
+	uint64_t sc_sta_tx_win_bytes;
+	uint64_t sc_sta_tx_last_us;	/* last iwx_tx */
+	uint64_t sc_sta_tx_hold_since_us; /* first refused dwell of this hold */
+	uint32_t sc_sta_tx_hold_skips;	/* dwells refused because of traffic */
+	uint32_t sc_sta_tx_hold_forced;	/* dwells let through by the hold cap */	/* total bytes seen by iwx_rx_mpdu_mq */
 
 	/* phy contexts.  we only use the first one */
 	struct iwx_phy_ctxt sc_phyctxt[IWX_NUM_PHY_CTX];

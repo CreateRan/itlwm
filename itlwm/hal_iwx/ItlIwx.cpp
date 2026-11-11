@@ -110,6 +110,20 @@
 #include "../../AirportItlwm/WCL/WCL.hpp"
 #endif
 #include "ItlIwx.hpp"
+
+/*
+ * Experiment B: firmware-delivered AWDL multicast data counter.
+ * Defined here with C linkage; published as "AWDLFwMcastData" by
+ * AirportItlwmAWDLInterface.
+ */
+extern "C" { uint32_t itl_awdl_fw_mcast_data; }
+/*
+ * expH: station RX bytes, published as "AWDLStaRxBytes" by
+ * AirportItlwmAWDLInterface.  File-scope rather than a softc field so the
+ * driver structures stay byte-for-byte identical to the expF build (a
+ * struct change was one of the unexplained-boot-failure candidates).
+ */
+extern "C" { uint64_t itl_awdl_sta_rx_bytes; }
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <FwData.h>
@@ -5827,6 +5841,20 @@ drop:
     return 1;
 }
 
+static uint64_t iwx_uptime_us();
+
+/*
+ * expH: RX half of the AWDL dwell hold.  The accounting lives inside the
+ * length-validated AWDL diagnostic branch below (the same branch expF has
+ * always run on every RX frame), so it touches the descriptor only under the
+ * exact guards the shipping build already used.  State is file-static: one
+ * card per machine, and no driver structure changes.
+ */
+#define IWX_STA_RX_WINDOW_US	200000		/* 200 ms rate window */
+#define IWX_STA_RX_WINDOW_BYTES	(96 * 1024)	/* ~3.8 Mbps sustained */
+static uint64_t s_hold_rx_win_us = 0;
+static uint64_t s_hold_rx_win_bytes = 0;
+
 void ItlIwx::
 iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
                size_t maxlen, struct mbuf_list *ml)
@@ -5851,8 +5879,28 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
      * awdl0 at all? Counted on the raw frame, before every host check.
      */
     int awdlUc = 0;
+    int awdlMcastRx = 0;
     if (ic->ic_awdl_addr_gen && le16toh(desc->mpdu_len) >= sizeof(struct ieee80211_frame) &&
         le16toh(desc->mpdu_len) <= maxlen - desc_size) {
+        /*
+         * expH: station RX accounting for the AWDL dwell hold.  An inbound
+         * bulk transfer leaves only ACKs on TX, so the hold needs to see
+         * what is coming in; otherwise the dwells keep running through the
+         * transfer and cap it (6 MB/s in vs 30 MB/s out on expF).  Inside
+         * the validated branch on purpose: mpdu_len is checked against
+         * maxlen above, exactly like the diagnostics this build already ran.
+         */
+        {
+            uint64_t now_us = iwx_uptime_us();
+            uint32_t rlen = le16toh(desc->mpdu_len);
+            
+            if (now_us - s_hold_rx_win_us > IWX_STA_RX_WINDOW_US) {
+                s_hold_rx_win_us = now_us;
+                s_hold_rx_win_bytes = 0;
+            }
+            s_hold_rx_win_bytes += (uint64_t)rlen;
+            itl_awdl_sta_rx_bytes += (uint64_t)rlen;
+        }
         const struct ieee80211_frame *awh =
             (const struct ieee80211_frame *)((const uint8_t *)pktdata + desc_size);
         if (IEEE80211_ADDR_EQ(awh->i_addr1, ic->ic_awdl_addr)) {
@@ -5867,6 +5915,25 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
                                                     desc->v3.channel : desc->v1.channel);
             if (!(desc->status & htole16(IWX_RX_MPDU_RES_STATUS_CRC_OK)))
                 ic->ic_awdl_fw_uc_badcrc++;
+        } else if ((awh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+                   IEEE80211_IS_MULTICAST(awh->i_addr1)) {
+            itl_awdl_fw_mcast_data++;
+            /*
+             * Experiment B: AirDrop discovery depends on link-local
+             * multicast reaching awdl0 (mDNS ff02::fb -> 33:33:00:00:00:fb,
+             * plus IPv4 01:00:5e and broadcast).  net80211's AWDL branch
+             * only accepts frames addressed to the AWDL interface, so
+             * rewrite the DA in the driver and let the regular AWDL data
+             * path deliver the frame.  Entirely driver-private: net80211
+             * is not modified.
+             */
+            if ((awh->i_addr1[0] == 0x33 && awh->i_addr1[1] == 0x33) ||
+                (awh->i_addr1[0] == 0x01 && awh->i_addr1[1] == 0x00 &&
+                 awh->i_addr1[2] == 0x5e) ||
+                (awh->i_addr1[0] == 0xff && awh->i_addr1[5] == 0xff)) {
+                awdlUc = 1;        /* treat like AWDL unicast downstream */
+                awdlMcastRx = 1;
+            }
         } else if ((awh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
                    !IEEE80211_IS_MULTICAST(awh->i_addr1) &&
                    !IEEE80211_ADDR_EQ(awh->i_addr1, ic->ic_myaddr)) {
@@ -5914,6 +5981,16 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, mbuf_t m, void *pktdata,
     mbuf_setdata(m, (uint8_t*)pktdata + desc_size, len);
     mbuf_pkthdr_setlen(m, len);
     mbuf_setlen(m, len);
+    
+    /*
+     * Experiment B: retarget AWDL multicast data to the AWDL interface
+     * address so net80211's existing AWDL branch (addr1 == ic_awdl_addr)
+     * accepts it and hands it to the AWDL data handler.
+     */
+    if (awdlMcastRx) {
+        struct ieee80211_frame *awr = mtod(m, struct ieee80211_frame *);
+        IEEE80211_ADDR_COPY(awr->i_addr1, ic->ic_awdl_addr);
+    }
     
     /* Account for padding following the frame header. */
     if (desc->mac_flags2 & IWX_RX_MPDU_MFLG2_PAD) {
@@ -7033,6 +7110,30 @@ iwx_tx_update_byte_tbl(struct iwx_softc *sc, struct iwx_tx_ring *txq, int idx, u
     }
 }
 
+/*
+ * Station TX accounting for the AWDL dwell hold (defined with the hold logic
+ * further down, next to the ROC code; the constants live here because iwx_tx
+ * needs them).
+ *
+ * The dwell moves the radio off the station's channel, and the station's TX
+ * direction stalls with it.  The hold is deliberately coarse: a 200 ms window
+ * and a 96 KB threshold (~3.8 Mbps sustained) so that mDNS, ARP and idle ACKs
+ * never hold the dwells, only real transfers do.
+ */
+#define IWX_STA_TX_WINDOW_US	200000		/* 200 ms rate window */
+#define IWX_STA_TX_WINDOW_BYTES	(96 * 1024)	/* ~3.8 Mbps sustained */
+#define IWX_STA_TX_IDLE_US	200000		/* silent this long: idle */
+#define IWX_STA_TX_HOLD_MAX_US	2000000		/* 2 s, then one dwell goes out */
+/*
+ * Activity rule (expG).  Both directions count, because a transfer into the
+ * Mac leaves almost nothing on TX (only ACKs, a few KB per 200 ms) and a
+ * TX-only rule let the dwells run straight through it.  Bulk traffic is
+ * exactly what a dwell must not interrupt, while mDNS (1/s), ARP, DHCP and
+ * idle keepalives stay far below the threshold in both directions.
+ */
+
+static uint64_t iwx_uptime_us();
+
 int ItlIwx::
 iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 {
@@ -7168,6 +7269,24 @@ iwx_tx(struct iwx_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     //    totlen = m->m_pkthdr.len;
     totlen = mbuf_pkthdr_len(m);
     
+    /*
+     * Station TX accounting for the AWDL dwell hold.  AWDL frames never come
+     * through here (iwx_awdl_tx_frame builds its own descriptor), so this is
+     * exactly the traffic the dwell would stall.
+     */
+    {
+        uint64_t now_us = iwx_uptime_us();
+        
+        if (now_us - sc->sc_sta_tx_win_us > IWX_STA_TX_WINDOW_US) {
+            sc->sc_sta_tx_win_us = now_us;
+            sc->sc_sta_tx_win_bytes = 0;
+        }
+        if (totlen > 0)
+            sc->sc_sta_tx_win_bytes += (uint64_t)totlen;
+        sc->sc_sta_tx_bytes += (uint64_t)totlen;
+        sc->sc_sta_tx_last_us = now_us;
+    }
+
     offload_assist = itlTxOffloadHeader(hdrlen);
     
     if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210) {
@@ -9078,6 +9197,75 @@ static bool iwx_p2p_listen_enabled()
     return enabled == 1;
 }
 
+/* The hold can be turned off to A/B it: -itlawdlnostahold. */
+static bool iwx_sta_tx_hold_enabled()
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        int v;
+        enabled = PE_parse_boot_argn("-itlawdlnostahold", &v, sizeof(v)) ? 0 : 1;
+    }
+    return enabled == 1;
+}
+
+/*
+ * Refuse the AWDL off-channel dwell while the station is really sending.
+ *
+ * The dwell moves the radio off the station's channel and the station's TX
+ * direction stalls with it.  Measured on AX200 against an iPhone over en1:
+ * 0.2-1 MB/s and 9% TCP retransmits while the dwells ran, 28-35 MB/s with
+ * AWDL off.  RX is not affected, which is why only the Mac->peer direction
+ * was slow.  A bulk transfer and the dwells therefore cannot overlap.
+ *
+ * The hold is bounded twice, because AWDL discovery needs dwells:
+ *  - only sustained traffic holds (200 ms window, 96 KB threshold), so mDNS,
+ *    ARP, DHCP and an idle TCP ACK never postpone a dwell;
+ *  - a hold never lasts longer than IWX_STA_TX_HOLD_MAX_US: after that one
+ *    dwell is let through, which keeps PSF/MI and the peer sequence alive
+ *    (the peer is dropped after 30 s of silence, so 2 s is far inside it).
+ */
+static bool iwx_sta_tx_busy(struct iwx_softc *sc)
+{
+    uint64_t now = iwx_uptime_us();
+    bool active;
+    
+    if (!iwx_sta_tx_hold_enabled())
+        return false;
+    
+    if (now - sc->sc_sta_tx_win_us > IWX_STA_TX_WINDOW_US) {
+        sc->sc_sta_tx_win_us = now;
+        sc->sc_sta_tx_win_bytes = 0;
+    }
+    if (now - s_hold_rx_win_us > IWX_STA_RX_WINDOW_US) {
+        s_hold_rx_win_us = now;
+        s_hold_rx_win_bytes = 0;
+    }
+    
+    /*
+     * Bulk traffic in either direction.  The RX side matters because a
+     * transfer into the Mac shows up here as a few KB of ACKs on TX; without
+     * it the dwells keep cutting the peer's packets and its ACK clock runs
+     * dry, which is the 6 MB/s seen on iPhone->Mac while the reverse ran at
+     * 30 MB/s on the same link.
+     */
+    active = (sc->sc_sta_tx_win_bytes >= IWX_STA_TX_WINDOW_BYTES) ||
+             (s_hold_rx_win_bytes >= IWX_STA_RX_WINDOW_BYTES);
+    if (!active) {
+        sc->sc_sta_tx_hold_since_us = 0;
+        return false;
+    }
+    
+    if (sc->sc_sta_tx_hold_since_us == 0)
+        sc->sc_sta_tx_hold_since_us = now;
+    else if (now - sc->sc_sta_tx_hold_since_us > IWX_STA_TX_HOLD_MAX_US) {
+        /* Fairness floor: let one dwell through so AWDL stays alive. */
+        sc->sc_sta_tx_hold_since_us = now;
+        sc->sc_sta_tx_hold_forced++;
+        return false;
+    }
+    return true;
+}
+
 /* uid of the AWDL listen scan (net80211 scans use 0); see iwx_awdl_listen. */
 #define IWX_AWDL_LISTEN_UID 1
 
@@ -9280,10 +9468,19 @@ iwx_awdl_tx_frame(struct iwx_softc *sc, const uint8_t *frame, size_t len)
     
     uint32_t rate_n_flags = (1 << sc->sc_mgmt_last_antenna_idx) << IWX_RATE_MCS_ANT_POS;
     uint8_t cmdver = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_TX_CMD);
+    /*
+     * PSF/MI (management) stay at 6 Mbps so every peer decodes them.  Data
+     * frames go at 54 Mbps: the 6 Mbps cap left the Mac->peer direction at
+     * ~0.7 MB/s and starved TCP ACKs during transfers.  Both rate spaces are
+     * indexed the same way as the existing comment: legacy index 0 = 6 Mbps,
+     * 7 = 54 Mbps (PLCP 3) on the older API.
+     */
+    bool isData = len > sizeof(struct ieee80211_frame) &&
+        (frame[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA;
     if (cmdver > 8 && cmdver != IWX_FW_CMD_VER_UNKNOWN)
-        rate_n_flags |= IWX_RATE_MCS_LEGACY_OFDM_MSK | 0;  /* legacy index 0 = 6 Mbps */
+        rate_n_flags |= IWX_RATE_MCS_LEGACY_OFDM_MSK | (isData ? 7 : 0);
     else
-        rate_n_flags |= IWX_RATE_6M_PLCP;
+        rate_n_flags |= isData ? IWX_RATE_54M_PLCP : IWX_RATE_6M_PLCP;
     uint32_t flags = IWX_TX_FLAGS_CMD_RATE | IWX_TX_FLAGS_ENCRYPT_DIS;
     uint16_t offload_assist = itlTxOffloadHeader(hdrlen);
     uint16_t cmd_size;
@@ -9563,6 +9760,17 @@ iwx_p2p_roc(struct iwx_softc *sc, uint8_t chan, uint16_t duration_tu)
 {
     int err;
     
+    /*
+     * A dwell taken while the station is sending costs more than the AWDL
+     * time it buys: the station's TX direction stalls for the whole dwell
+     * (see iwx_sta_tx_busy).  Refused here, before the pending/running check,
+     * so a hold never disturbs the firmware state machine.
+     */
+    if (iwx_sta_tx_busy(sc)) {
+        sc->sc_sta_tx_hold_skips++;
+        iwx_aux_roc_sync_counters(sc);
+        return EBUSY;
+    }
     if (sc->sc_aux_roc_pending || sc->sc_aux_roc_running) {
         /* A lost notification must not stop the listen for good. */
         if (++sc->sc_p2p_wait > 64) {
@@ -9737,6 +9945,9 @@ iwx_aux_roc_sync_counters(struct iwx_softc *sc)
     ic->ic_awdl_roc_end_fail_short = sc->sc_p2p_end_fail_short;
     ic->ic_awdl_roc_chan_changes = sc->sc_p2p_chan_changes;
     ic->ic_awdl_roc_band_changes = sc->sc_p2p_band_changes;
+    ic->ic_awdl_tx_hold_skips = sc->sc_sta_tx_hold_skips;
+    ic->ic_awdl_tx_hold_forced = sc->sc_sta_tx_hold_forced;
+    ic->ic_awdl_sta_tx_bytes = sc->sc_sta_tx_bytes;
     ic->ic_awdl_roc_sta_err = sc->sc_aux_roc_sta_err;
     ic->ic_awdl_roc_sta_stage = sc->sc_aux_roc_sta_stage;
     ic->ic_awdl_roc_sta_code = sc->sc_aux_roc_sta_code;

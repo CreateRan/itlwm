@@ -13,6 +13,10 @@
 
 extern IOCommandGate *_fCommandGate;
 
+/* Experiment B: AWDL mcast data counter from ItlIwx.cpp. */
+extern "C" uint32_t itl_awdl_fw_mcast_data;
+extern "C" uint64_t itl_awdl_sta_rx_bytes;
+
 OSDefineMetaClassAndStructors(AirportItlwmAWDLInterface, IO80211AWDLProtocol);
 OSDefineMetaClassAndStructors(AirportItlwmAWDLEthernetInterface, AirportItlwmEthernetInterface);
 
@@ -70,6 +74,33 @@ performCommand(IONetworkController *controller, unsigned long cmd, void *arg0, v
 static bool awDataAllowed();
 static uint64_t hostUs();
 
+/*
+ * Experiment C diagnostics: unknown AWDL data payloads are logged as
+ * AWDLDataRxBadSnap (first bytes after the 802.11 header) plus FC and
+ * length, so the peer's actual encapsulation can be identified.
+ */
+static void
+inputAWDLDataBad(AirportItlwmAWDLInterface *awdl, const struct ieee80211_frame *wh,
+                 const uint8_t *payload, size_t plen, size_t total)
+{
+    static uint32_t sBadCount;
+    sBadCount++;
+    if (sBadCount > 8 && (sBadCount & 0x3f) != 1)
+        return;
+    awdl->setProperty("AWDLDataRxBadCount", sBadCount, 32);
+    awdl->setProperty("AWDLDataRxBadLen", (uint32_t)total, 32);
+    uint16_t fc = wh ? (uint16_t)(wh->i_fc[0] | (wh->i_fc[1] << 8)) : 0;
+    awdl->setProperty("AWDLDataRxBadFc", fc, 32);
+    size_t n = plen > 24 ? 24 : plen;
+    if (n) {
+        OSData *d = OSData::withBytes(payload, (unsigned int)n);
+        if (d) {
+            awdl->setProperty("AWDLDataRxBadSnap", d);
+            d->release();
+        }
+    }
+}
+
 int AirportItlwmAWDLEthernetInterface::
 inputAWDLData(mbuf_t m, AirportItlwmAWDLInterface *awdl)
 {
@@ -94,22 +125,59 @@ inputAWDLData(mbuf_t m, AirportItlwmAWDLInterface *awdl)
             return 1;
         }
     }
-    static const uint8_t kSnap[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2 };
-    const size_t llc = 8, awdlHdr = 8;
-    if (len < hdr + llc + awdlHdr || memcmp(p + hdr, kSnap, sizeof(kSnap)) ||
-        p[hdr + 6] != 0x08 || p[hdr + 7] != 0x00) {
+    /*
+     * Experiment C: the peer may send IP data either in the Apple AWDL
+     * encapsulation (SNAP OUI 00:17:F2, PID 08:00, 8-byte AWDL header) or
+     * as plain Ethernet-over-802.11 (standard SNAP OUI 00:00:00).  Accept
+     * both; unknown formats go through inputAWDLDataBad() for diagnosis.
+     */
+    static const uint8_t kSnapApple[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2 };
+    static const uint8_t kSnapStd[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+    const size_t llc = 8;
+    size_t awdlHdr;    /* encapsulation bytes between 802.11 hdr and Ethernet payload */
+    uint8_t ethType[2];
+    if (len >= hdr + llc + 8 && !memcmp(p + hdr, kSnapApple, sizeof(kSnapApple)) &&
+        p[hdr + 6] == 0x08 && p[hdr + 7] == 0x00) {
+        /* Apple style: SNAP(OUI 00:17:F2, PID 0x0800) + 8B AWDL data header. */
+        awdlHdr = llc + 8;
+        ethType[0] = p[hdr + 14];
+        ethType[1] = p[hdr + 15];
+    } else if (len >= hdr + llc + 8 && !memcmp(p + hdr + 8, kSnapStd, sizeof(kSnapStd))) {
+        /*
+         * Experiment D: frames actually observed from the peer (multicast
+         * mDNS included) carry the 8-byte AWDL data header FIRST and then
+         * a standard SNAP whose PID is the Ethernet type.  AWDLDataRxBadSnap
+         * decoded: 04 6f 00 60 28 00 00 00 | aa aa 03 00 00 00 08 00 |
+         * 45 00 ...  The Ethernet type sits at offset 14 and the payload
+         * at offset 16, same as the Apple style.
+         */
+        static uint32_t sRxAwlHdrFirst;
+        sRxAwlHdrFirst++;
+        if ((sRxAwlHdrFirst & 0x0f) == 1)
+            awdl->setProperty("AWDLDataRxAwlHdrFirst", sRxAwlHdrFirst, 32);
+        awdlHdr = llc + 8;
+        ethType[0] = p[hdr + 14];
+        ethType[1] = p[hdr + 15];
+    } else if (len >= hdr + llc && !memcmp(p + hdr, kSnapStd, sizeof(kSnapStd))) {
+        static uint32_t sRxStdLlc;
+        sRxStdLlc++;
+        if ((sRxStdLlc & 0x0f) == 1)
+            awdl->setProperty("AWDLDataRxStdLlc", sRxStdLlc, 32);
+        awdlHdr = llc;
+        ethType[0] = p[hdr + 6];
+        ethType[1] = p[hdr + 7];
+    } else {
+        inputAWDLDataBad(awdl, wh, p + hdr, len >= hdr ? len - hdr : 0, len);
         awdl->fDataRxBad++;
         mbuf_freem(m);
         return 1;
     }
-    const uint8_t *ad = p + hdr + llc;
-    uint8_t ethType[2] = { ad[6], ad[7] };
     uint8_t dst[6], src[6];
     memcpy(dst, wh->i_addr1, 6);
     memcpy(src, wh->i_addr2, 6);
 
     // Keep 14 bytes of the stripped headers for the Ethernet header.
-    size_t strip = hdr + llc + awdlHdr - 14;
+    size_t strip = hdr + awdlHdr - 14;
     mbuf_adj(m, (int)strip);
     uint8_t *eh = (uint8_t *)mbuf_data(m);
     memcpy(eh, dst, 6);
@@ -491,6 +559,7 @@ stopAWTimeline()
     if (fAWTimer)
         fAWTimer->cancelTimeout();
     fListenAlignedActive = false;
+    fDwellLive = false;
     fPeerValid = false;
     fPeerChanValid = false;
     if (fController) {
@@ -647,8 +716,25 @@ postAWEvents()
 void AirportItlwmAWDLInterface::
 syncFromFrame(const uint8_t *af, size_t len, const uint8_t *src, uint64_t rxUs)
 {
-    if (!fAWRunning || isSyncMaster() || memcmp(src, &fSyncMaster, sizeof(fSyncMaster)))
+    if (!fAWRunning)
         return;
+    /*
+     * Normally only the elected master may pull our timeline. That deadlocks
+     * here: the peer manager elects us master, our PSF leaves on our own free
+     * running grid, the phone never hears it (hence never joins), so nobody
+     * ever contradicts the election and the timeline never follows the phone
+     * we can hear perfectly well (+/-5 ms off, an AW is only 16 TU).
+     * While we are master, follow the peer we track ourselves instead; if it
+     * ever hears us the election settles on its own.
+     */
+    bool followingPeer = false;
+    if (isSyncMaster()) {
+        if (!fPeerValid || memcmp(src, &fPeerMac, sizeof(fPeerMac)))
+            return;
+        followingPeer = true;
+    } else if (memcmp(src, &fSyncMaster, sizeof(fSyncMaster))) {
+        return;
+    }
     size_t off = kAWDLFixedHeaderLen;
     while (off + 3 <= len) {
         uint8_t type = af[off];
@@ -691,13 +777,18 @@ syncFromFrame(const uint8_t *af, size_t len, const uint8_t *src, uint64_t rxUs)
             // error persists, the sequence differs or we are not locked yet.
             const int64_t kOutlierUs = 6000;
             bool large = err > kOutlierUs || err < -kOutlierUs;
-            if (fSyncUpdates && !seqErr && large && ++fSyncOutliers < 3) {
+            // Coming off a free running timeline every error is large; that is
+            // the offset we are here to remove, not a latency spike.
+            if (!followingPeer && fSyncUpdates && !seqErr && large && ++fSyncOutliers < 3) {
                 setProperty("AWDLSyncOutliers", fSyncOutliersTotal + 1, 64);
                 fSyncOutliersTotal++;
                 return;
             }
             fSyncOutliers = 0;
 
+            if (followingPeer && (fRefUs != boundary || fRefSeq != seq))
+                fSyncFollowPeer++;
+            bool gridMoved = fRefUs != boundary;
             fRefUs = boundary;
             fRefSeq = seq;
             fSyncUpdates++;
@@ -706,6 +797,17 @@ syncFromFrame(const uint8_t *af, size_t len, const uint8_t *src, uint64_t rxUs)
                 publishSyncState();
             }
             scheduleNextAW(hostUs());
+            /*
+             * The pending listen timer was armed on the pre-pull grid; without
+             * re-arming it the dwell goes out at the old boundary while the
+             * peer (and our own PSFs, built from the new fRefUs) use the new
+             * one. Pulls are frequent (every peer PSF), so the drift between
+             * arm and pull is small, but it was systematic.  Never re-arm
+             * while an in-window EBUSY retry is pending: that would abandon
+             * the window we are trying to recover.
+             */
+            if (gridMoved && fListenAlignedActive && !fListenRetries)
+                scheduleAlignedListen(hostUs());
             return;
         }
         off += 3 + tlen;
@@ -833,10 +935,22 @@ publishListenState()
     setProperty("AWDLRocEndFailLastUs", ic->ic_awdl_roc_end_fail_last_us, 32);
     setProperty("AWDLRocChanChanges", ic->ic_awdl_roc_chan_changes, 32);
     setProperty("AWDLRocBandChanges", ic->ic_awdl_roc_band_changes, 32);
+    /*
+     * Dwells held off because the station was sending: with the dwell running
+     * the station's TX direction stalls, so a bulk transfer over en1 and the
+     * AWDL dwells are mutually exclusive.  AWDLTxHoldForced counts the dwells
+     * let through by the 2 s fairness cap (those keep AWDL alive during a
+     * long transfer).
+     */
+    setProperty("AWDLTxHoldSkips", ic->ic_awdl_tx_hold_skips, 32);
+    setProperty("AWDLTxHoldForced", ic->ic_awdl_tx_hold_forced, 32);
+    setProperty("AWDLStaTxBytes", ic->ic_awdl_sta_tx_bytes, 64);
+    setProperty("AWDLStaRxBytes", itl_awdl_sta_rx_bytes, 64);
     char per[96];
-    snprintf(per, sizeof(per), "6:%llu/%llu 44:%llu/%llu 149:%llu/%llu 161:%llu/%llu",
+    snprintf(per, sizeof(per), "6:%llu/%llu 44:%llu/%llu 149:%llu/%llu 161:%llu/%llu home:%llu",
              fListenOnChan[0], fRxAFChan6, fListenOnChan[1], fRxAFChan44,
-             fListenOnChan[2], fRxAFChan149, fListenOnChan[3], fRxAFChan161);
+             fListenOnChan[2], fRxAFChan149, fListenOnChan[3], fRxAFChan161,
+             fListenOnHome);
     setProperty("AWDLListenByChan", per);
     if (awTxAllowed())
         publishTxState();
@@ -890,6 +1004,8 @@ startListen(unsigned chan, uint32_t dwellTU, unsigned home, bool aligned)
         fListenStarted++;
         if (aligned)
             fListenAligned++;
+        if (home && chan == home)
+            fListenOnHome++;
         int idx = chan == 6 ? 0 : chan == 44 ? 1 : chan == 149 ? 2 : chan == 161 ? 3 : -1;
         if (idx >= 0)
             fListenOnChan[idx]++;
@@ -904,7 +1020,21 @@ startListen(unsigned chan, uint32_t dwellTU, unsigned home, bool aligned)
 
 // A listen goes out this long before the slot: the firmware took about 4.4 ms
 // from the command to its START notification.
-static const int64_t kListenLeadUs = 6000;
+// Measured on AX200: the ROC only becomes usable 21 ms after the command
+// (AWDLRocDelayUs), so the old 6 ms value armed it *after* the slot boundary
+// and every PSF went out into a dwell that was not running yet (AWDLTxFwBusy,
+// 64% of the sends refused). Arm a full ROC setup time early, and keep a margin:
+// the delay is not constant.
+static const int64_t kListenLeadUs = 30000;
+// Typical command -> dwell running latency, kept out of the dwell budget.
+// Measured on AX200: the minimum observed command -> dwell latency is 23.6 ms
+// (AWDLRocMinUs), so the old 16 ms assumption armed dwells that started after
+// the window they were for. 24 ms matches the measured floor.
+static const int64_t kRocSetupUs = 24000;
+// A refused listen (previous ROC still tearing down) is retried this often
+// inside the window instead of dropping the whole 65 ms slot.
+static const int64_t kListenRetryGapUs = 6000;
+static const int kListenRetryMax = 8;
 // Without a frame from the peer for this long, go back to listening blindly.
 static const uint64_t kPeerStaleUs = 30000000;
 static const uint64_t kPeerReplaceUs = 10000000;
@@ -949,6 +1079,17 @@ trackPeer(const uint8_t *af, size_t len, const uint8_t *src, uint64_t rxUs, unsi
 {
     if (!fAWRunning || !awListenAllowed())
         return;
+    /*
+     * Promiscuous RX also loops our own PSF/MI back in. Taking that for the
+     * peer makes every "peer" comparison a comparison with ourselves: the
+     * peer channel sequence came out byte-identical to ours and the peer
+     * timeline is our own free-running one, so the +/-5 ms offset it reported
+     * was never the phone's. Drop our own transmissions here.
+     */
+    if (!memcmp(src, &fMac, sizeof(fMac))) {
+        fPeerSelfRx++;
+        return;
+    }
     if (fPeerValid && memcmp(src, &fPeerMac, sizeof(fPeerMac))) {
         if ((int64_t)(rxUs - fPeerSeenUs) < (int64_t)kPeerReplaceUs)
             return;
@@ -1041,12 +1182,15 @@ scheduleOwnListen(uint64_t afterUs)
     // few seconds or IO80211Family drops it from NDP (lastAF ~6 s). When our own
     // slot keeps us home (or off AWDL) but the peer's slot at that time is on a
     // non-home channel, listen there instead (on unless -itlawdlnopeerlisten).
-    bool usePeer = awPeerListenAllowed() && fPeerValid && fPeerChanValid && fPeerSlotUs &&
-        fPeerPm && now - fPeerSeenUs <= kPeerStaleUs;
+    bool peerAlive = fPeerValid && now - fPeerSeenUs <= kPeerStaleUs;
+    bool usePeer = awPeerListenAllowed() && peerAlive && fPeerChanValid && fPeerSlotUs &&
+        fPeerPm;
     for (int i = 0; i < 32; i++, k++) {
         uint16_t seq = (uint16_t)(fRefSeq + k * pm);
         uint8_t chan = ownChannelAt(seq);
         bool fromPeer = false;
+        bool homeDwell = false;
+        unsigned run = 1;
         if ((!chan || chan == home) && usePeer) {
             unsigned pc = peerChannelAt((uint64_t)(fRefUs + k * slot + slot / 2));
             if (pc && pc != home) {
@@ -1054,20 +1198,58 @@ scheduleOwnListen(uint64_t afterUs)
                 fromPeer = true;
             }
         }
-        if (!chan || chan == home)
-            continue;
-        unsigned run = 1;
-        if (!fromPeer) {
+        if (!chan || chan == home) {
+            /*
+             * Our sequence keeps the radio on the station's channel for this
+             * slot (0 = not on AWDL at all). Data and the PSF still have to go
+             * out, and the peer spends most of its own slots on that same
+             * channel, so dwell on it: the firmware only posts a frame while a
+             * dwell runs (iwx_awdl_tx) and no channel switch is needed. Without
+             * a peer there is nothing to send, keep skipping then.
+             */
+            if (!awDataAllowed() || !peerAlive || !home)
+                continue;
+            chan = (uint8_t)home;
+            homeDwell = true;
+            /*
+             * Cover the whole run of consecutive home slots with a single ROC.
+             * An ROC costs ~21 ms to come up and the dwell cannot be shorter
+             * than the slot, so one ROC per slot leaves no room at all: the
+             * next request lands on the running one (EBUSY) and every second
+             * slot was lost. The TX timer walks the slot boundaries inside the
+             * dwell instead (see txTimerFired).
+             */
+            while (run < 16) {
+                uint8_t nextChan = ownChannelAt((uint16_t)(seq + run * pm));
+                if (nextChan && nextChan != home)
+                    break;
+                run++;
+            }
+        }
+        if (!fromPeer && !homeDwell) {
             while (run < 16 && ownChannelAt((uint16_t)(seq + run * pm)) == chan)
                 run++;
         }
         if (fromPeer)
             fListenPeerSlots++;
-        uint32_t dwell = (uint32_t)((run * slot + kListenLeadUs) / 1024);
+        // Budget per run: the dwell starts kRocSetupUs after its command (which
+        // goes out kListenLeadUs before the slot), and it must have ended by
+        // the time the next command goes out, kListenLeadUs before the next
+        // run.  The lead cancels out: the dwell may run run*slot - setup minus
+        // a small margin.  A late ROC end notification still trips the next
+        // command (EBUSY), but listenTimerFired retries inside the window now.
+        int64_t room = (int64_t)(run * slot) - kRocSetupUs - 2048;
+        uint32_t dwell = room > 0 ? (uint32_t)(room / 1024) : 8;
         if (dwell > fListenDwellTU)
             dwell = fListenDwellTU;
         fListenNextChan = chan;
         fListenNextDwellTU = dwell;
+        fListenNextHome = homeDwell;
+        // Exact slot boundary on our own timeline: the PSF/MI timers must use
+        // this, not the time the listen timer happened to fire (jitter there is
+        // larger than the 16 TU AW window).
+        fListenNextSlotUs = (uint64_t)(fRefUs + k * slot);
+        fListenRetries = 0;
         uint64_t abs;
         nanoseconds_to_absolutetime((uint64_t)(fRefUs + k * slot - kListenLeadUs) * 1000, &abs);
         fListenTimer->cancelTimeout();
@@ -1109,11 +1291,17 @@ scheduleAlignedListen(uint64_t afterUs)
         unsigned run = 1;
         while (run < 16 && fPeerChan[((seq / fPeerPm) + run) % 16] == chan)
             run++;
-        uint32_t dwell = (uint32_t)((run * slot + kListenLeadUs) / 1024);
+        // Same budget as scheduleOwnListen: the lead cancels out (see there),
+        // so the dwell may run until just before the next command.
+        int64_t room = (int64_t)(run * slot) - kRocSetupUs - 2048;
+        uint32_t dwell = room > 0 ? (uint32_t)(room / 1024) : 8;
         if (dwell > fListenDwellTU)
             dwell = fListenDwellTU;
         fListenNextChan = (uint8_t)chan;
         fListenNextDwellTU = dwell;
+        fListenNextHome = false;
+        fListenNextSlotUs = (uint64_t)(fPeerRefUs + k * slot);
+        fListenRetries = 0;
         uint64_t abs;
         nanoseconds_to_absolutetime((uint64_t)(fPeerRefUs + k * slot - kListenLeadUs) * 1000, &abs);
         fListenTimer->cancelTimeout();
@@ -1135,17 +1323,57 @@ listenTimerFired(OSObject *owner, IOTimerEventSource *)
     ieee80211com *ic = that->fController->fHalService->get80211Controller();
     if (ic && ic->ic_awdl_listen && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss) {
         unsigned home = ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan);
-        if (home != that->fListenNextChan && !(++that->fListenSlot % that->fListenEveryNth)) {
+        bool homeDwell = that->fListenNextHome && home && that->fListenNextChan == home;
+        if (homeDwell || (home != that->fListenNextChan && !(++that->fListenSlot % that->fListenEveryNth))) {
+            /*
+             * Dwell on the station's own channel needs no channel switch, but
+             * the firmware still needs a running dwell to post PSF/MI and data,
+             * so it goes through the same ROC path.
+             *
+             * A refused command (previous ROC still tearing down; the end
+             * notification lags by up to ~28 ms) used to drop the whole 65 ms
+             * window: the phone transmits through all of it (our PSF advertised
+             * the slot) and every frame is lost. Retry inside the window
+             * instead, shrinking the dwell to what is left of the slot.
+             */
+            if (that->fListenRetries) {
+                int64_t room = (int64_t)(that->fListenNextSlotUs + that->slotUs()) -
+                               (int64_t)now - kRocSetupUs - 2048;
+                if (room < 8 * 1024) {
+                    that->fListenRetries = 0;
+                    that->scheduleAlignedListen(now + (uint64_t)dwell * 1024 + (uint64_t)kRocSetupUs);
+                    return;
+                }
+                uint32_t left = (uint32_t)(room / 1024);
+                if (left < dwell)
+                    dwell = left;
+            }
             uint64_t before = that->fListenStarted;
             that->startListen(that->fListenNextChan, dwell, home, true);
             if (that->fListenStarted != before) {
-                if (awDataAllowed())
+                if (that->fListenRetries)
+                    that->fListenBusyRecovered++;
+                that->fListenRetries = 0;
+                if (homeDwell)
+                    that->fListenHomeDwells++;
+                else if (awDataAllowed())
                     that->fListenOwn++;
-                that->scheduleTx(that->fListenNextChan, now + kListenLeadUs);
+                that->noteDwell(dwell);
+                that->scheduleTx(that->fListenNextChan, that->fListenNextSlotUs ? that->fListenNextSlotUs : now + kListenLeadUs);
+            } else if (that->fListenRetries < kListenRetryMax) {
+                that->fListenRetries++;
+                uint64_t abs;
+                nanoseconds_to_absolutetime((now + kListenRetryGapUs) * 1000, &abs);
+                that->fListenTimer->wakeAtTime(abs);
+                return;
+            } else {
+                that->fListenRetries = 0;
             }
         }
     }
-    that->scheduleAlignedListen(now + (uint64_t)dwell * 1024);
+    // The ROC stays up kRocSetupUs past the requested dwell; arming the next
+    // one before that is what the driver answers with EBUSY.
+    that->scheduleAlignedListen(now + (uint64_t)dwell * 1024 + (uint64_t)kRocSetupUs);
 }
 
 #pragma mark - stage 3 step 1: transmit (host side of the firmware PSF / MI engine)
@@ -1158,7 +1386,27 @@ listenTimerFired(OSObject *owner, IOTimerEventSource *)
 static const uint8_t kAWDLBssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 static const int64_t kTxPSFAtUs = 1000;
 static const int64_t kTxMIAtUs = 4000;
+// A PSF that finds the dwell not running yet is retried inside the AW.
+static const int64_t kTxRetryGapUs = 2500;
+static const int kTxRetryMax = 5;
+// Spacing between the PSF and the MI when the PSF went out late.
+static const int64_t kTxMIGapUs = 3000;
 enum : uint8_t { kAWDLSubtypePSF = 0, kAWDLSubtypeMI = 3 };
+
+// Remember how long the dwell that just started stays alive. Consecutive home
+// slots share one ROC, so the TX timer walks the slot boundaries inside it
+// instead of asking for a new one (each ROC costs ~21 ms and collides).
+void AirportItlwmAWDLInterface::
+noteDwell(uint32_t dwellTU)
+{
+    fDwellChan = fListenNextChan;
+    fDwellLive = true;
+    // The ROC comes up kRocSetupUs after the command. Being slightly optimistic
+    // here is safe: a frame outside the dwell is refused and counted, not lost.
+    fDwellEndUs = hostUs() + (uint64_t)dwellTU * 1024 + (uint64_t)kRocSetupUs;
+    if ((uint64_t)dwellTU * 1024 > slotUs() + 2048)
+        fDwellSpans++;
+}
 
 void AirportItlwmAWDLInterface::
 scheduleTx(uint8_t chan, uint64_t slotStartUs)
@@ -1171,6 +1419,7 @@ scheduleTx(uint8_t chan, uint64_t slotStartUs)
     }
     fTxChan = chan;
     fTxSlotUs = slotStartUs;
+    fTxRetries = 0;
     fTxPhase = 1;
     uint64_t abs;
     nanoseconds_to_absolutetime((slotStartUs + kTxPSFAtUs) * 1000, &abs);
@@ -1185,11 +1434,35 @@ txTimerFired(OSObject *owner, IOTimerEventSource *)
     if (!that || !that->fTxPhase || !that->fAWRunning)
         return;
     if (that->fTxPhase == 1) {
+        int err = 0;
         if (that->fSyncTmplLen)
-            that->sendAWDLFrame(false);
+            err = that->sendAWDLFrame(false);
+        /*
+         * Still EAGAIN means the dwell has not come up yet (the ROC needs
+         * ~15 ms). The AW window is wider than that, so try again a little
+         * later instead of dropping the only frame the phone syncs on.
+         */
+        if (err && that->fTxRetries < kTxRetryMax) {
+            that->fTxRetries++;
+            that->fTxRetriesTotal++;
+            uint64_t nowAbs;
+            nanoseconds_to_absolutetime(hostUs() + kTxRetryGapUs, &nowAbs);
+            that->fTxTimer->wakeAtTime(nowAbs);
+            return;
+        }
+        that->fTxRetries = 0;
+        // Time the MI from the PSF that actually went out, not from the slot
+        // boundary we hoped for. fTxSlotUs stays on the grid, the chaining below
+        // walks it slot by slot.
+        uint64_t miAt = that->fTxSlotUs + kTxMIAtUs;
+        if (!err) {
+            uint64_t sent = hostUs();
+            if (sent + kTxMIGapUs > miAt)
+                miAt = sent + kTxMIGapUs;
+        }
         that->fTxPhase = 2;
         uint64_t abs;
-        nanoseconds_to_absolutetime((that->fTxSlotUs + kTxMIAtUs) * 1000, &abs);
+        nanoseconds_to_absolutetime(miAt * 1000, &abs);
         that->fTxTimer->wakeAtTime(abs);
         return;
     }
@@ -1202,6 +1475,20 @@ txTimerFired(OSObject *owner, IOTimerEventSource *)
             that->flushData();
         else if (that->fDataQCount)
             that->fDataTxNotCommon++;
+    }
+    /*
+     * Same dwell, next slot: put a PSF on it too. One ROC per slot cannot fit
+     * (setup + dwell > slot), so the long home dwell carries several slots and
+     * the frames are chained here.
+     */
+    if (that->fDwellLive && that->fDwellChan == that->fTxChan && awTxAllowed()) {
+        uint64_t nextSlot = that->fTxSlotUs + that->slotUs();
+        if (nextSlot + (uint64_t)kTxMIAtUs < that->fDwellEndUs) {
+            that->fTxChained++;
+            that->scheduleTx(that->fTxChan, nextSlot);
+        } else {
+            that->fDwellLive = false;
+        }
     }
     if (((that->fTxPSF + that->fTxMI + that->fTxRefused) & 0x1f) <= 1)
         that->publishTxState();
@@ -1324,30 +1611,31 @@ buildAWDLFrame(uint8_t *buf, size_t cap, bool mi, uint64_t nowUs)
     return need;
 }
 
-void AirportItlwmAWDLInterface::
+int AirportItlwmAWDLInterface::
 sendAWDLFrame(bool mi)
 {
     ieee80211com *ic = fController ? fController->fHalService->get80211Controller() : nullptr;
     if (!ic || !ic->ic_awdl_tx)
-        return;
+        return ENXIO;
     static uint8_t frame[2048];             // work loop only
     size_t len = buildAWDLFrame(frame, sizeof(frame), mi, hostUs());
     if (!len) {
         fTxLastErr = 0x100;
         fTxRefused++;
-        return;
+        return EINVAL;
     }
     int err = ic->ic_awdl_tx(ic, fTxChan, frame, len);
     if (err) {
         fTxRefused++;
         fTxLastErr = err;
-        return;
+        return err;
     }
     fTxLastLen = (uint32_t)len;
     if (mi)
         fTxMI++;
     else
         fTxPSF++;
+    return 0;
 }
 
 void AirportItlwmAWDLInterface::
@@ -1388,7 +1676,17 @@ flushData()
             memset(frame, 0, hdr + llc + ad);
             struct ieee80211_frame *wh = (struct ieee80211_frame *)frame;
             wh->i_fc[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_DATA;
-            memcpy(wh->i_addr1, eh, 6);
+            // AWDL has no shared medium. A group-addressed Ethernet frame (mDNS
+            // to 33:33:00:00:00:fb) put into addr1 as-is is never delivered: on
+            // Broadcom the firmware replicates it to every cached AWDL peer, we
+            // bypass that path, so the peer just drops it. Send it as unicast to
+            // the peer we hear instead (one peer tracked per address).
+            if ((eh[0] & 0x01) && fPeerValid) {
+                memcpy(wh->i_addr1, &fPeerMac, 6);
+                fDataTxMcastAsUc++;
+            } else {
+                memcpy(wh->i_addr1, eh, 6);
+            }
             memcpy(wh->i_addr2, &fMac, 6);
             memcpy(wh->i_addr3, kAWDLBssid, 6);
             uint16_t sc = (uint16_t)(fTxSeq++ << 4);
@@ -1441,8 +1739,11 @@ publishDataState()
     setProperty("AWDLDataTxErr", fDataTxErr, 64);
     setProperty("AWDLDataTxPending", fDataQCount, 32);
     setProperty("AWDLDataTxNotCommon", fDataTxNotCommon, 64);
+    setProperty("AWDLDataTxMcastAsUc", fDataTxMcastAsUc, 64);
     setProperty("AWDLListenOwn", fListenOwn, 64);
     setProperty("AWDLListenPeerSlots", fListenPeerSlots, 64);
+    setProperty("AWDLListenHomeDwells", fListenHomeDwells, 64);
+    setProperty("AWDLListenBusyRecovered", fListenBusyRecovered, 64);
 }
 
 void AirportItlwmAWDLInterface::
@@ -1474,6 +1775,10 @@ publishTxState()
     setProperty("AWDLFwUcLastChannel", ic->ic_awdl_fw_uc_last_chan, 32);
     setProperty("AWDLFwUcLastFc", ic->ic_awdl_fw_uc_last_fc, 32);
     setProperty("AWDLFwForeignData", ic->ic_awdl_fw_foreign_data, 32);
+    setProperty("AWDLFwMcastData", itl_awdl_fw_mcast_data, 32);
+    // AWDL discovery is multicast: firmware side vs. what net80211 accepted.
+    // fw 0 = the frames never reached the host; accepted 0 with fw > 0 = they
+    // are being dropped between the driver and awdl0.
     setProperty("AWDLPromisc", ic->ic_awdl_want_data ? true : false);
     setProperty("AWDLPromiscChanges", ic->ic_awdl_promisc_changes, 32);
     // Which net80211 drop path feeds the station's input errors.
@@ -1510,6 +1815,11 @@ publishSyncState()
     setProperty("AWDLAWStarts", fAWStarts, 64);
     setProperty("AWDLAWSeq", fLastSeq, 32);
     setProperty("AWDLSyncUpdates", fSyncUpdates, 64);
+    setProperty("AWDLSyncFollowPeer", fSyncFollowPeer, 64);
+    setProperty("AWDLPeerSelfRx", fPeerSelfRx, 64);
+    setProperty("AWDLTxRetries", fTxRetriesTotal, 64);
+    setProperty("AWDLTxChained", fTxChained, 64);
+    setProperty("AWDLDwellSpans", fDwellSpans, 64);
     setProperty("AWDLSyncErrUs", (uint64_t)fLastSyncErrUs, 32);
     setProperty("AWDLPresenceMode", presenceMode(), 32);
 }
@@ -1712,6 +2022,7 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fLastSeq = 0;
     fAWStarts = 0;
     fSyncUpdates = 0;
+    fSyncFollowPeer = 0;
     fLastSyncErrUs = 0;
     memset(&fSyncMaster, 0, sizeof(fSyncMaster));
     fSyncMode = 0;
@@ -1734,6 +2045,10 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fListenAlignedActive = false;
     fListenNextChan = 0;
     fListenNextDwellTU = 0;
+    fListenNextSlotUs = 0;
+    fListenNextHome = false;
+    fListenRetries = 0;
+    fListenBusyRecovered = 0;
     fListenAligned = 0;
     fListenNoSlot = 0;
     fPeerValid = false;
@@ -1744,6 +2059,11 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fPeerSlotUs = 0;
     fPeerChanValid = false;
     fPeerUpdates = 0;
+    fPeerSelfRx = 0;
+    fDwellLive = false;
+    fDwellEndUs = 0;
+    fDwellChan = 0;
+    fDwellSpans = 0;
     fPeerPredHit = 0;
     fPeerPredMiss = 0;
     fPeerLastErrUs = 0;
@@ -1768,6 +2088,9 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fTxPSF = 0;
     fTxMI = 0;
     fTxRefused = 0;
+    fTxRetries = 0;
+    fTxRetriesTotal = 0;
+    fTxChained = 0;
     fTxSkipMode = 0;
     fTxLastErr = 0;
     fTxLastLen = 0;
@@ -1788,10 +2111,13 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fDataTxErr = 0;
     fListenOwn = 0;
     fListenPeerSlots = 0;
+    fListenHomeDwells = 0;
+    fListenOnHome = 0;
     memset(fRxGap, 0, sizeof(fRxGap));
     fBssidSets = 0;
     fPeerCacheOps = 0;
     fDataTxNotCommon = 0;
+    fDataTxMcastAsUc = 0;
     AWDL_LOG("role %u prefix %s mac %s", role, prefix, ether_sprintf(mac->octet));
     return true;
 }

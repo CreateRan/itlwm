@@ -184,6 +184,7 @@ private:
     uint16_t fLastSeq;
     uint64_t fAWStarts;
     uint64_t fSyncUpdates;
+    uint64_t fSyncFollowPeer;      // timeline pulls taken from the tracked peer
     int64_t fLastSyncErrUs;
     ether_addr fSyncMaster;    // from setAWDL_SYNC_STATE; zero = none programmed
     uint32_t fSyncMode;
@@ -206,6 +207,7 @@ private:
     bool parsePeerChanSeq(const uint8_t *v, size_t len);
     unsigned peerChannelAt(uint64_t us) const;
     void scheduleAlignedListen(uint64_t afterUs);
+    void noteDwell(uint32_t dwellTU);
     // -itlawdldata: dwell on our own channel sequence (what we advertise), as
     // Broadcom firmware does, instead of chasing the peer's sequence.
     bool scheduleOwnListen(uint64_t afterUs);
@@ -214,12 +216,21 @@ private:
     uint64_t fBssidSets;
     uint64_t fPeerCacheOps;
     uint64_t fDataTxNotCommon;      // data held: peer not on our channel now
+    uint64_t fDataTxMcastAsUc;      // group data resent as unicast to the peer
     void startListen(unsigned chan, uint32_t dwellTU, unsigned home, bool aligned);
     IOTimerEventSource *fListenTimer;
     uint32_t fListenAlign;          // AWDLListenAlign
     bool fListenAlignedActive;      // the listen timer drives the listens
     uint8_t fListenNextChan;
     uint32_t fListenNextDwellTU;
+    uint8_t fListenRetries;         // EBUSY retries left for the current window
+    uint64_t fListenBusyRecovered;  // windows recovered by those retries
+    uint64_t fListenNextSlotUs;    // exact slot boundary (host us) for PSF/MI timing
+    uint8_t fDwellChan;            // channel of the dwell that is (or was) running
+    uint64_t fDwellEndUs;          // estimated end of the running dwell
+    bool fDwellLive;               // the TX timer may chain PSFs inside it
+    uint64_t fDwellSpans;          // dwells covering more than one slot
+    bool fListenNextHome;          // dwell on the station channel, no channel switch
     uint64_t fListenAligned;
     uint64_t fListenNoSlot;
     bool fPeerValid;
@@ -232,6 +243,7 @@ private:
     uint8_t fPeerChan[16];
     bool fPeerChanValid;
     uint64_t fPeerUpdates;
+    uint64_t fPeerSelfRx;           // own PSF/MI seen on the promiscuous path
     uint64_t fPeerPredHit;
     uint64_t fPeerPredMiss;
     int64_t fPeerLastErrUs;
@@ -240,6 +252,8 @@ private:
     uint64_t fRxAFChan149;
     uint64_t fRxAFChanOther;
     uint64_t fListenPeerSlots;      // dwells scheduled on the peer's channel in our home/off slots
+    uint64_t fListenHomeDwells;     // dwells started on the station channel itself
+    uint64_t fListenOnHome;         // dwells that ran on the station channel
     // Per transmitter: when its last AWDL action frame arrived and the longest
     // gap so far. IO80211Family drops a peer from NDP after ~6 s without one
     // (shouldRemovePeerFromNDP, lastAF), which kills a running AirDrop.
@@ -265,7 +279,7 @@ private:
     // during each aligned listen dwell.
     static void txTimerFired(OSObject *owner, IOTimerEventSource *sender);
     void scheduleTx(uint8_t chan, uint64_t slotStartUs);
-    void sendAWDLFrame(bool mi);
+    int sendAWDLFrame(bool mi);
     size_t buildAWDLFrame(uint8_t *buf, size_t cap, bool mi, uint64_t nowUs);
     void publishTxState();
     void publishAWDLAddress();
@@ -304,6 +318,9 @@ private:
     uint64_t fTxMI;
     uint64_t fTxRefused;            // driver refused (not dwelling, ring full)
     uint64_t fTxSkipMode;           // AF tx mode said suppress
+    uint8_t fTxRetries;             // PSF retries inside the current slot
+    uint64_t fTxRetriesTotal;            // PSF retries that ended up sending
+    uint64_t fTxChained;            // PSFs put on a later slot of the same dwell
     uint32_t fTxLastErr;
     uint32_t fTxLastLen;
     uint8_t fChanSeq[400];     // raw apple80211_awdl_sync_channel_sequence

@@ -39,7 +39,8 @@ including scanning, connecting, network switching, and private Wi-Fi addresses.
 - **Wi-Fi 6 (802.11ax / HE) is disabled by default.**
   Add `itlwm_he=1` to enable it on supported adapters.
 - WPA2-Personal and WPA2/WPA3 transition networks with optional PMF are supported.
-  WPA3-only, mandatory PMF, AWDL / AirDrop, and MLO are not supported.
+  WPA3-only, mandatory PMF, and MLO are not supported.
+- **AWDL / AirDrop is supported** through a host-side AWDL stack (see below).
 - Device support follows the upstream hardware table; Tahoe compatibility still
   requires validation on each adapter.
 
@@ -53,6 +54,63 @@ To build locally, install Xcode and Python 3, and check out MacKernelSDK commit
 xcodebuild -project itlwm.xcodeproj -scheme AirportItlwm-Tahoe \
   -configuration Release ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO build
 ```
+
+## AWDL / AirDrop on macOS 26 (this fork's work)
+
+macOS 26 moved the AWDL stack into `IO80211Family`, so the driver must provide
+its own `IO80211AWDLProtocol` subclass (`awdl0`) and do in the host what the
+Broadcom firmware used to do: availability windows, AWDL action frames, P2P
+device address, and channel sequencing. On top of that stack, this fork adds
+three layers measured against real AirDrop traffic:
+
+**1. Bidirectional dwell hold** — while a data transfer is running, channel
+dwell requests are deferred (`EBUSY`) instead of yanking the radio off the
+station channel mid-transfer. The busy test counts bytes on *both* directions:
+a receive-heavy flow (iPhone → Mac) is mostly ACKs on the TX side, so a
+TX-only test would keep "discovering" the radio as idle and starve the
+receiver. Fairness cap: at most 2 s of consecutive holds, then one dwell is
+forced so the peer never sees the Mac vanish.
+
+**2. Idle presence dwell** — with no live peer the home-branch slots used to
+be skipped entirely, leaving only the 2.4 GHz social-channel slots: the Mac
+announced itself on channel 6 while an idle iPhone sits on the station's
+channel, and neither hears the other. That is the "first send sits on
+Waiting" failure. Now, when the peer is idle or absent, a low-rate (500 ms)
+presence dwell keeps sync/MI frames going out on the station channel — no
+channel switch, no band change, data gate stays closed.
+
+**3. Cross-band channel clamp** — each AWDL sequence still contains one
+2.4 GHz social slot; on a 5 GHz station this costs a PHY REMOVE + ADD round
+trip (measured 23 ms deaf, 53-58 ms when it overlaps traffic, twice per
+sequence). The AirDrop control exchange runs below the hold threshold, so it
+hit those windows unprotected: captures show 2 of 3 SYNs lost, a 4.3 kB SACK
+hole, SYN-ACKs retransmitted 4 times, and the station link dropping outright.
+Cross-band slots are now folded into the station channel (same-band switches
+like 149 ↔ 44 are kept); the announced channel-sequence TLV is clamped the
+same way, so peers hear what we actually do.
+
+Everything above is runtime-adaptive: the clamp target is the station's
+*current* channel (`ic_bss`), so it follows the router — nothing is hardwired
+to 149.
+
+**Observed results** (AX200, macOS 26.7.2): discovery becomes instant, the
+first iPhone → Mac send no longer stalls on "Waiting", control-plane QUIC
+handshake answers in ~5 ms, and Wi-Fi no longer drops when AirDrop is active.
+Measured throughput: Mac → iPhone 26-29 MB/s, iPhone → Mac 10-17 MB/s
+(previously 6).
+
+**Diagnostics** (`ioreg -l | grep AWDL`): `AWDLTxHoldSkips`,
+`AWDLTxHoldForced`, `AWDLStaTxBytes`, `AWDLRocBandChanges`,
+`AWDLPresenceDwells`, `AWDLChanClamps`, `AWDLChanSeq`, `AWDLPeerChanSeq`.
+
+**Boot-args** (all switches are off-switches; features are on by default):
+
+| Boot-arg | Effect |
+|---|---|
+| `itlwm_he=1` | Enable Wi-Fi 6 (HE) |
+| `-itlawdlnostahold` | Disable the bidirectional dwell hold (A/B) |
+| `-itlawdnopresence` | Disable the idle presence dwell (A/B) |
+| `-itlawdnochanclamp` | Disable the cross-band channel clamp (A/B) |
 
 ## Questions and Issues
 

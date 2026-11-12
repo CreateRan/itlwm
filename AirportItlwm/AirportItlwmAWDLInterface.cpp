@@ -1038,6 +1038,82 @@ static const int kListenRetryMax = 8;
 // Without a frame from the peer for this long, go back to listening blindly.
 static const uint64_t kPeerStaleUs = 30000000;
 static const uint64_t kPeerReplaceUs = 10000000;
+/*
+ * Presence keepalive (expI).  With no live peer the home branch below never
+ * runs, so the only listens left are the social-channel slots: the Mac
+ * announces itself on the social channel while the phone idles on the
+ * station's channel, and neither hears the other.  That is the "first send
+ * sits on Waiting" case: the phone opens its share sheet, listens where it
+ * already is, and hears nothing from us until it starts probing on its own.
+ *
+ * A low-rate home dwell keeps a sync/MI frame going out where the phone
+ * actually sits.  The dwell is on the channel the station already uses, so it
+ * costs no channel switch and no band change - only a short P2P context
+ * activation.  The data gate stays closed: nothing is transmitted but the
+ * presence frames.
+ */
+static const int64_t kPresencePeriodUs = 500000;
+static uint64_t s_presenceLastUs;
+static uint64_t s_presenceDwells;
+
+// -itlawdnopresence turns the keepalive off, for A/B runs.
+static bool awPresenceAllowed()
+{
+    static int allowed = -1;
+    if (allowed < 0) {
+        int v = 0;
+        allowed = PE_parse_boot_argn("-itlawdnopresence", &v, sizeof(v)) ? 0 : 1;
+    }
+    return allowed == 1;
+}
+
+static bool presenceDue(uint64_t now)
+{
+    if (now - s_presenceLastUs < (uint64_t)kPresencePeriodUs)
+        return false;
+    s_presenceLastUs = now;
+    s_presenceDwells++;
+    return true;
+}
+
+/*
+ * expJ: social-channel clamp.  A cross-band slot (the 2.4 GHz social channel
+ * while the station sits on 5 GHz) costs a PHY REMOVE + ADD round trip on the
+ * P2P context - measured 23 ms deaf, 53-58 ms when it overlaps traffic - and
+ * happens twice per AWDL sequence.  The AirDrop control exchange runs at a
+ * rate far below the hold threshold, so it hits those windows unprotected:
+ * captures show 2 of 3 SYNs lost, a 4.3 kB SACK hole, and a SYN-ACK
+ * retransmitted 4 times, with the station link dropping too.
+ *
+ * Fold cross-band slots into the station channel instead; same-band switches
+ * (149 <-> 44) stay, they are a cheap in-band MODIFY.  The announced channel
+ * sequence is clamped the same way so peers hear what we actually do.
+ * -itlawdnochanclamp restores the unclamped schedule, for A/B runs.
+ */
+static int s_chanClampAllowed = -1;
+static uint64_t s_chanClamps;
+
+static bool awChanClampAllowed(void)
+{
+    if (s_chanClampAllowed < 0) {
+        int v = 0;
+        s_chanClampAllowed = PE_parse_boot_argn("-itlawdnochanclamp", &v, sizeof(v)) ? 0 : 1;
+    }
+    return s_chanClampAllowed == 1;
+}
+
+static uint8_t awClampChan(uint8_t chan, unsigned home, ieee80211com *ic)
+{
+    if (!chan || !home || chan == home || !ic)
+        return chan;
+    if (!awChanClampAllowed())
+        return chan;
+    if (IEEE80211_IS_CHAN_2GHZ(&ic->ic_channels[chan]) ==
+        IEEE80211_IS_CHAN_2GHZ(&ic->ic_channels[home]))
+        return chan;
+    s_chanClamps++;
+    return (uint8_t)home;
+}
 
 static int64_t floorDiv(int64_t a, int64_t b)
 {
@@ -1187,12 +1263,13 @@ scheduleOwnListen(uint64_t afterUs)
         fPeerPm;
     for (int i = 0; i < 32; i++, k++) {
         uint16_t seq = (uint16_t)(fRefSeq + k * pm);
-        uint8_t chan = ownChannelAt(seq);
+        uint8_t chan = awClampChan(ownChannelAt(seq), home, ic);
         bool fromPeer = false;
         bool homeDwell = false;
         unsigned run = 1;
         if ((!chan || chan == home) && usePeer) {
             unsigned pc = peerChannelAt((uint64_t)(fRefUs + k * slot + slot / 2));
+            pc = awClampChan((uint8_t)pc, home, ic);
             if (pc && pc != home) {
                 chan = (uint8_t)pc;
                 fromPeer = true;
@@ -1207,7 +1284,17 @@ scheduleOwnListen(uint64_t afterUs)
              * dwell runs (iwx_awdl_tx) and no channel switch is needed. Without
              * a peer there is nothing to send, keep skipping then.
              */
-            if (!awDataAllowed() || !peerAlive || !home)
+            if (!home)
+                continue;
+            /*
+             * Two reasons to dwell on the station's channel: data (peer alive
+             * and the data gate open), or presence (nobody is talking to us,
+             * but the peer idles on this very channel).  iwx_awdl_tx only
+             * transmits while a dwell runs, so without the presence dwell the
+             * Mac has no window to announce itself where the phone listens.
+             */
+            if (!(awDataAllowed() && peerAlive) &&
+                !(awPresenceAllowed() && presenceDue(now)))
                 continue;
             chan = (uint8_t)home;
             homeDwell = true;
@@ -1220,14 +1307,15 @@ scheduleOwnListen(uint64_t afterUs)
              * dwell instead (see txTimerFired).
              */
             while (run < 16) {
-                uint8_t nextChan = ownChannelAt((uint16_t)(seq + run * pm));
+                uint8_t nextChan = awClampChan(ownChannelAt((uint16_t)(seq + run * pm)), home, ic);
                 if (nextChan && nextChan != home)
                     break;
                 run++;
             }
         }
         if (!fromPeer && !homeDwell) {
-            while (run < 16 && ownChannelAt((uint16_t)(seq + run * pm)) == chan)
+            while (run < 16 &&
+                awClampChan(ownChannelAt((uint16_t)(seq + run * pm)), home, ic) == chan)
                 run++;
         }
         if (fromPeer)
@@ -1266,6 +1354,15 @@ scheduleAlignedListen(uint64_t afterUs)
 {
     fListenAlignedActive = false;
     if (awDataAllowed()) {
+        scheduleOwnListen(afterUs);
+        return;
+    }
+    /*
+     * Presence: no live peer, so nothing below can schedule a listen (it needs
+     * a fresh peer channel), and the AW slots that stay home are skipped by
+     * maybeListen.  Keep the home dwells coming on our own timeline instead.
+     */
+    if (awPresenceAllowed() && (!fPeerValid || hostUs() - fPeerSeenUs > kPeerStaleUs)) {
         scheduleOwnListen(afterUs);
         return;
     }
@@ -1544,11 +1641,16 @@ buildAWDLFrame(uint8_t *buf, size_t cap, bool mi, uint64_t nowUs)
     uint16_t curAW = (uint16_t)(seq + ((int64_t)nowUs - start) / ((int64_t)period * 1024));
     uint16_t down = (uint16_t)((start + slot - (int64_t)nowUs + 1023) / 1024);
     unsigned count = fChanSeqValid ? fChanSeq[kChanSeqCount] : 0;
+    /* Announce what we actually do: cross-band entries clamped to the
+     * station channel, matching awClampChan() in the scheduler. */
+    ieee80211com *bldIc = fController ? fController->fHalService->get80211Controller() : nullptr;
+    unsigned bldHome = (bldIc && bldIc->ic_state == IEEE80211_S_RUN && bldIc->ic_bss)
+        ? ieee80211_chan2ieee(bldIc, bldIc->ic_bss->ni_chan) : 0;
     auto chanAt = [&](uint16_t s) -> uint8_t {
         if (!count)
-            return 6;
+            return awClampChan(6, bldHome, bldIc);
         const apple80211_channel *c = (const apple80211_channel *)(fChanSeq + kChanSeqEntries) + (s / pm) % count;
-        return (uint8_t)c->channel;
+        return awClampChan((uint8_t)c->channel, bldHome, bldIc);
     };
     const ether_addr &master = isSyncMaster() ? fMac : fSyncMaster;
     uint8_t masterChan = fMasterChannel ? (uint8_t)fMasterChannel : 6;
@@ -1575,7 +1677,7 @@ buildAWDLFrame(uint8_t *buf, size_t cap, bool mi, uint64_t nowUs)
         uint8_t fill = fChanSeqValid ? fChanSeq[9] : 255;
         put16(q + 4, fill == 255 ? 0xffff : (uint16_t)(fill | (opClass(fill) << 8)));
         for (unsigned i = 0; i < 16; i++) {
-            uint8_t c = count ? chanAt((uint16_t)(i * pm)) : 6;
+            uint8_t c = count ? chanAt((uint16_t)(i * pm)) : awClampChan(6, bldHome, bldIc);
             q[6 + 2 * i] = c;
             q[7 + 2 * i] = opClass(c);
         }
@@ -1743,6 +1845,8 @@ publishDataState()
     setProperty("AWDLListenOwn", fListenOwn, 64);
     setProperty("AWDLListenPeerSlots", fListenPeerSlots, 64);
     setProperty("AWDLListenHomeDwells", fListenHomeDwells, 64);
+    setProperty("AWDLPresenceDwells", s_presenceDwells, 64);
+    setProperty("AWDLChanClamps", s_chanClamps, 64);
     setProperty("AWDLListenBusyRecovered", fListenBusyRecovered, 64);
 }
 
@@ -2113,6 +2217,9 @@ init(IO80211Controller *controller, ether_addr *mac, unsigned int role, char con
     fListenPeerSlots = 0;
     fListenHomeDwells = 0;
     fListenOnHome = 0;
+    s_presenceLastUs = 0;
+    s_presenceDwells = 0;
+    s_chanClamps = 0;
     memset(fRxGap, 0, sizeof(fRxGap));
     fBssidSets = 0;
     fPeerCacheOps = 0;
